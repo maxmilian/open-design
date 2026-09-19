@@ -4,6 +4,8 @@ import path from 'node:path';
 
 import {
   runVelaCommand,
+  velaCommandStderr,
+  velaCommandStdout,
   velaWorkspaceCommandOptions,
 } from '../integrations/vela-command.js';
 
@@ -68,6 +70,12 @@ const VELA_MAX_INPUT_IMAGES = 5;
 const VELA_VIDEO_RATIOS = new Set(['16:9', '9:16', '1:1']);
 const VELA_VIDEO_DURATIONS = new Set([5, 10]);
 
+/** The installed local media runtime predates Vela's media command surface. */
+export const VELA_MEDIA_CLI_INCOMPATIBLE_CODE = 'MEDIA_CLI_INCOMPATIBLE';
+
+const VELA_MEDIA_COMMAND_MISSING_RE =
+  /unknown command\s+["'](?:media|image|video)["']\s+for\s+["']vela["']/i;
+
 function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -91,6 +99,15 @@ function parseJsonObject(stdout: string, command: string): JsonRecord {
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function submittedImageTaskIdFromPollingFailure(
+  error: unknown,
+): string | undefined {
+  const match = velaCommandStderr(error).match(
+    /(?:^|\r?\n)Error: perform media request GET \/api\/v1\/media\/images\/tasks\/(mit_[A-Za-z0-9_-]+):/,
+  );
+  return match?.[1];
 }
 
 function positiveIntegerFromEnv(name: string, fallback: number): number {
@@ -261,10 +278,15 @@ async function fetchPublishedImageCapabilities(
   wireModel: string,
   runCommand: VelaCommandRunner,
 ): Promise<VelaPublishedImageCapabilities | null> {
-  const stdout = await runCommand(['media', 'models', '--json'], {
-    ...velaWorkspaceCommandOptions(input.workspaceId),
-    timeoutMs: VELA_MODELS_TIMEOUT_MS,
-  });
+  let stdout: string;
+  try {
+    stdout = await runCommand(['media', 'models', '--json'], {
+      ...velaWorkspaceCommandOptions(input.workspaceId),
+      timeoutMs: VELA_MODELS_TIMEOUT_MS,
+    });
+  } catch (error) {
+    throw velaMediaErrorFromFailure(error, 'media models') ?? error;
+  }
   return parsePublishedProfiles(stdout, wireModel, edits);
 }
 
@@ -378,10 +400,46 @@ export async function renderVelaImage(
       outputPath,
       '--json',
     ];
-    const stdout = await runCommand(args, {
-      ...velaWorkspaceCommandOptions(input.workspaceId),
-      timeoutMs: VELA_IMAGE_TIMEOUT_MS,
-    });
+    let stdout: string;
+    try {
+      stdout = await runCommand(args, {
+        ...velaWorkspaceCommandOptions(input.workspaceId),
+        timeoutMs: VELA_IMAGE_TIMEOUT_MS,
+      });
+    } catch (error) {
+      // A refused request is a verdict the user can act on, so it must reach
+      // them as one. Decode it before transport recovery so a provider verdict
+      // can never be mistaken for a retryable polling failure.
+      const providerError = velaMediaErrorFromFailure(error, `image ${command}`);
+      if (providerError) throw providerError;
+
+      const submittedTaskId = submittedImageTaskIdFromPollingFailure(error);
+      if (!submittedTaskId) throw error;
+
+      // `vela image gen --wait` has already submitted (and potentially charged)
+      // the remote task before its status GET can time out. Resume that exact
+      // task instead of calling `gen` again, which avoids duplicate work and
+      // duplicate billing while tolerating a transient poll failure.
+      try {
+        stdout = await runCommand(
+          [
+            'image',
+            'get',
+            submittedTaskId,
+            '--wait',
+            '--output',
+            outputPath,
+            '--json',
+          ],
+          {
+            ...velaWorkspaceCommandOptions(input.workspaceId),
+            timeoutMs: VELA_IMAGE_TIMEOUT_MS,
+          },
+        );
+      } catch (recoveryError) {
+        throw velaMediaErrorFromFailure(recoveryError, 'image get') ?? recoveryError;
+      }
+    }
     const asset = parseJsonObject(stdout, `image ${command}`);
     const assetId = nonEmptyString(asset.asset_id);
     const status = nonEmptyString(asset.status);
@@ -410,6 +468,107 @@ export async function renderVelaImage(
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
+
+/**
+ * The stable, provider-neutral code Vela publishes when a content-safety
+ * policy refused an image request. It is the same string at every layer from
+ * the provider adapter through the API and the CLI, which is what makes it
+ * safe to key product behaviour on.
+ */
+export const VELA_SAFETY_REJECTION_CODE = 'safety_rejection';
+
+/**
+ * Optional, non-authoritative hint about what a safety policy objected to.
+ * Absent whenever the upstream supplier could not prove it — callers must then
+ * fall back to naming both possibilities rather than picking one.
+ */
+export type VelaSafetySubject = 'prompt' | 'input_image' | 'output_image';
+
+const VELA_SAFETY_SUBJECTS: readonly string[] = [
+  'prompt',
+  'input_image',
+  'output_image',
+];
+
+/**
+ * A Vela media failure that arrived with a machine-readable verdict rather
+ * than only a human sentence.
+ *
+ * `code` is carried on the error itself because the media task route copies
+ * `err.code` straight into the persisted task snapshot; that is what lets the
+ * web client render a definite explanation instead of depending on the agent
+ * to repeat one correctly.
+ */
+export class VelaMediaError extends Error {
+  readonly code: string;
+  readonly subject: VelaSafetySubject | undefined;
+  readonly retryable: boolean | undefined;
+
+  constructor(
+    message: string,
+    detail: {
+      code: string;
+      subject?: VelaSafetySubject | undefined;
+      retryable?: boolean | undefined;
+    },
+  ) {
+    super(message);
+    this.name = 'VelaMediaError';
+    this.code = detail.code;
+    this.subject = detail.subject;
+    this.retryable = detail.retryable;
+  }
+}
+
+function safetySubject(value: unknown): VelaSafetySubject | undefined {
+  return typeof value === 'string' && VELA_SAFETY_SUBJECTS.includes(value)
+    ? (value as VelaSafetySubject)
+    : undefined;
+}
+
+/**
+ * Rebuild a structured failure from a rejected `vela image --json` run.
+ *
+ * Returns undefined for every failure that carried no task JSON — a CLI
+ * validation error, a crash, a timeout — so those keep their existing generic
+ * handling. An unrecognised or absent `code` is deliberately NOT promoted to a
+ * safety rejection: mislabelling an outage as a policy refusal would send a
+ * user off to rewrite a prompt that was never the problem.
+ */
+export function velaMediaErrorFromFailure(
+  error: unknown,
+  label: string,
+): VelaMediaError | undefined {
+  const commandMessage = error instanceof Error ? error.message : '';
+  if (VELA_MEDIA_COMMAND_MISSING_RE.test(commandMessage)) {
+    return new VelaMediaError(
+      'the local media runtime is too old; update it and try again',
+      {
+        code: VELA_MEDIA_CLI_INCOMPATIBLE_CODE,
+        retryable: false,
+      },
+    );
+  }
+  const stdout = velaCommandStdout(error).trim();
+  if (!stdout) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.error)) return undefined;
+  const code = nonEmptyString(parsed.error.code);
+  if (!code) return undefined;
+  const message = nonEmptyString(parsed.error.message);
+  const retryable =
+    typeof parsed.error.retryable === 'boolean' ? parsed.error.retryable : undefined;
+  return new VelaMediaError(message ?? `Vela ${label} failed with ${code}`, {
+    code,
+    subject: safetySubject(parsed.error.subject),
+    retryable,
+  });
 }
 
 export async function renderVelaVideo(

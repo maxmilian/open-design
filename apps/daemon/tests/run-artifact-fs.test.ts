@@ -2,17 +2,33 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import {
   createRunArtifactBaselines,
   diffRunArtifacts,
   primaryArtifactChangeForRun,
   snapshotProjectArtifacts,
+  snapshotProjectArtifactsAsync,
 } from '../src/run-artifact-fs.js';
 
 function tmpProject(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'od-artifact-fs-'));
 }
+
+test('the async snapshot preserves the synchronous snapshot contract', async () => {
+  const root = tmpProject();
+  fs.mkdirSync(path.join(root, 'nested'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'index.html'), '<html>page</html>');
+  fs.writeFileSync(path.join(root, 'nested', 'styles.css'), 'body {}');
+  fs.writeFileSync(path.join(root, 'nested', 'notes.txt'), 'not tracked');
+  fs.writeFileSync(path.join(root, 'node_modules', 'ignored.html'), '<html>ignored</html>');
+
+  assert.deepEqual(
+    await snapshotProjectArtifactsAsync(root),
+    snapshotProjectArtifacts(root),
+  );
+});
 
 test('a second-round edit of an existing artifact counts as touched, not zero', () => {
   const root = tmpProject();
@@ -42,6 +58,7 @@ test('a second-round edit of an existing artifact counts as touched, not zero', 
     renderDependencyTouched: 0,
     renderDependencyTouchedPaths: [],
     supportingMediaTouched: 0,
+    filesWritten: 1,
   });
 });
 
@@ -68,6 +85,7 @@ test('created vs modified are reported separately and sum into touched', () => {
     renderDependencyTouched: 0,
     renderDependencyTouchedPaths: [],
     supportingMediaTouched: 1,
+    filesWritten: 2,
   });
 });
 
@@ -91,6 +109,7 @@ test('a touched DESIGN.md sets designSystemCreated but not artifact_count', () =
     renderDependencyTouched: 0,
     renderDependencyTouchedPaths: [],
     supportingMediaTouched: 0,
+    filesWritten: 1, // …but it IS a written file
   });
 
   // Editing it on a later round still flags the design-system signal.
@@ -115,7 +134,7 @@ test('preview modules are counted and also count as artifacts', () => {
   assert.equal(diff.created, 2);
 });
 
-test('non-artifact files and ignored dirs do not count', () => {
+test('non-artifact files and ignored dirs do not count as artifacts', () => {
   const root = tmpProject();
   const before = snapshotProjectArtifacts(root);
 
@@ -138,7 +157,29 @@ test('non-artifact files and ignored dirs do not count', () => {
     renderDependencyTouched: 0,
     renderDependencyTouchedPaths: [],
     supportingMediaTouched: 0,
+    // notes.txt IS a written file; node_modules stays ignored entirely.
+    filesWritten: 1,
   });
+});
+
+test('an md-only delivery reports files_written while artifact_count stays 0', () => {
+  // The blind spot that motivated files_written_count: a run whose deliverable
+  // is a markdown brief (e.g. `PROMPTS.md`) looked identical to a pure chat
+  // turn because markdown is not an artifact extension.
+  const root = tmpProject();
+  const before = snapshotProjectArtifacts(root);
+
+  fs.writeFileSync(path.join(root, 'PROMPTS.md'), '# nine premium backgrounds');
+  const afterCreate = snapshotProjectArtifacts(root);
+  const createDiff = diffRunArtifacts(before, afterCreate);
+  assert.equal(createDiff.touched, 0, 'md never counts as an artifact');
+  assert.equal(createDiff.filesWritten, 1);
+
+  // A later run that only EDITS the md still reports its write.
+  fs.writeFileSync(path.join(root, 'PROMPTS.md'), '# nine premium backgrounds — revised');
+  const editDiff = diffRunArtifacts(afterCreate, snapshotProjectArtifacts(root));
+  assert.equal(editDiff.touched, 0);
+  assert.equal(editDiff.filesWritten, 1);
 });
 
 test('a same-size rewrite with a preserved mtime is still detected (content hash)', () => {
@@ -193,6 +234,25 @@ test('a CSS-only visible edit modifies the primary HTML artifact without inflati
     interactionMode: 'design',
     clarificationRequested: false,
   }), 'modified');
+});
+
+test('module-script variants participate in render dependency syntax checks', () => {
+  const root = tmpProject();
+  const esm = path.join(root, 'app.mjs');
+  const commonjs = path.join(root, 'legacy.cjs');
+  fs.writeFileSync(esm, 'export const ready = false;');
+  fs.writeFileSync(commonjs, 'module.exports = false;');
+  const before = snapshotProjectArtifacts(root);
+  fs.writeFileSync(esm, 'export const ready = true;');
+  fs.writeFileSync(commonjs, 'module.exports = true;');
+  const after = snapshotProjectArtifacts(root);
+
+  const diff = diffRunArtifacts(before, after);
+  assert.equal(diff.renderDependencyTouched, 2);
+  assert.deepEqual(
+    diff.renderDependencyTouchedPaths.map((file) => path.basename(file)).sort(),
+    ['app.mjs', 'legacy.cjs'],
+  );
 });
 
 test('first generation is created even when the run edits a pre-seeded HTML file', () => {
@@ -273,5 +333,49 @@ test('a no-op turn (no file writes) reports zero', () => {
     renderDependencyTouched: 0,
     renderDependencyTouchedPaths: [],
     supportingMediaTouched: 0,
+    filesWritten: 0,
   });
+});
+
+for (const mode of ['sync', 'async'] as const) {
+  test(`${mode} missing filesystem snapshots cannot attest to a zero-write run`, async () => {
+    const root = tmpProject();
+    try {
+      const missing = path.join(root, 'does-not-exist');
+      const snapshot = mode === 'sync' ? snapshotProjectArtifacts : snapshotProjectArtifactsAsync;
+      const before = await snapshot(missing);
+      const after = await snapshot(missing);
+      const diff = diffRunArtifacts(before, after);
+      assert.equal(diff.filesWritten, 0); // Legacy counter remains best-effort.
+      assert.equal(diff.filesWrittenUnknown, true);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+test('a directory read failure remains unknown even when another directory is measured successfully', () => {
+  const root = tmpProject();
+  try {
+    const unreadable = path.join(root, 'private');
+    fs.mkdirSync(unreadable);
+    fs.writeFileSync(path.join(unreadable, 'draft.html'), '<title>hidden from this scan</title>');
+    const before = snapshotProjectArtifacts(root);
+    const read = fs.readdirSync;
+    const spy = vi.spyOn(fs, 'readdirSync').mockImplementation((...args: Parameters<typeof fs.readdirSync>) => {
+      if (String(args[0]) === unreadable) throw new Error('fixture read failure');
+      return Reflect.apply(read, fs, args);
+    });
+    try { assert.equal(diffRunArtifacts(before, snapshotProjectArtifacts(root)).filesWrittenUnknown, true); }
+    finally { spy.mockRestore(); }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the existing snapshot file budget reports incomplete coverage instead of a known zero', () => {
+  const root = tmpProject();
+  try {
+    for (let i = 0; i < 5001; i += 1) fs.writeFileSync(path.join(root, `note-${i}.txt`), 'x');
+    const before = snapshotProjectArtifacts(root);
+    const after = snapshotProjectArtifacts(root);
+    assert.equal(before.size, 5000);
+    assert.equal(diffRunArtifacts(before, after).filesWrittenUnknown, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

@@ -11,6 +11,7 @@ import {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
 });
 
 const templates = HOME_HERO_CHIPS.filter((chip) => chip.group === 'create');
@@ -25,61 +26,112 @@ function labelFor(chipId: string): string {
   return chipById(chipId).label;
 }
 
-function descriptionFor(chipId: string): string {
-  return chipById(chipId).description ?? '';
-}
-
-function renderPicker(activeChipId: string | null, onClear = vi.fn()) {
-  const onPick = vi.fn();
-  return {
-    onClear,
-    onPick,
-    ...render(
-      <TemplatePicker
-        templates={templates}
-        activeChipId={activeChipId}
-        labelFor={labelFor}
-        descriptionFor={descriptionFor}
-        onPick={onPick}
-        onClear={onClear}
-      />,
-    ),
-  };
-}
-
+// The pill is display + clear: picking a type belongs to the type row under
+// the composer, and the dropdown this used to open was removed (per product)
+// once that row carried the whole catalog one line below.
 describe('TemplatePicker', () => {
-  it('highlights a selected template and exposes an inline reset control', () => {
-    const onClear = vi.fn();
-    const view = renderPicker('wireframe', onClear);
-
-    expect(screen.getByTestId('home-hero-template-picker').className).toContain('has-selection');
-    expect(screen.getByTestId('home-hero-template-trigger').textContent).toContain('Wireframe');
-    const reset = screen.getByTestId('home-hero-template-reset');
-    const resetIcon = reset.querySelector('svg');
-    expect(resetIcon).not.toBeNull();
-    expect(resetIcon?.getAttribute('width')).toBe('16');
-    expect(resetIcon?.getAttribute('height')).toBe('16');
-
-    fireEvent.click(reset);
-    expect(onClear).toHaveBeenCalledTimes(1);
-    expect(screen.queryByTestId('home-hero-template-menu')).toBeNull();
-
-    view.rerender(
+  it('names the committed template and opens nothing when clicked', () => {
+    const onClearTemplate = vi.fn();
+    render(
       <TemplatePicker
         templates={templates}
-        activeChipId={null}
+        activeChipId="document"
+        onClearTemplate={onClearTemplate}
         labelFor={labelFor}
-        descriptionFor={descriptionFor}
-        onPick={vi.fn()}
-        onClear={onClear}
       />,
     );
 
-    expect(screen.getByTestId('home-hero-template-picker').className).not.toContain('has-selection');
+    expect(screen.getByTestId('home-hero-template-picker').className).toContain('has-selection');
+    expect(screen.getByTestId('home-hero-template-trigger').textContent).toContain('Document');
+
+    fireEvent.click(screen.getByTestId('home-hero-template-trigger'));
+    expect(screen.queryByTestId('home-hero-template-menu')).toBeNull();
+    expect(screen.queryByTestId('home-hero-template-wedge-prototype')).toBeNull();
+  });
+
+  it('renders nothing at all with no template picked', () => {
+    // The pill IS the committed value. An empty placeholder in the card would
+    // name a field that is answered by the type row below it.
+    render(
+      <TemplatePicker templates={templates} activeChipId={null} labelFor={labelFor} />,
+    );
+
+    expect(screen.queryByTestId('home-hero-template-picker')).toBeNull();
+    expect(screen.queryByTestId('home-hero-template-trigger')).toBeNull();
+  });
+
+  it('clears the template from the leading icon', () => {
+    const onClearTemplate = vi.fn();
+    render(
+      <TemplatePicker
+        templates={templates}
+        activeChipId="document"
+        onClearTemplate={onClearTemplate}
+        labelFor={labelFor}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('home-hero-template-clear'));
+    expect(onClearTemplate).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers no clear when the host supplies no handler', () => {
+    render(
+      <TemplatePicker templates={templates} activeChipId="document" labelFor={labelFor} />,
+    );
+
+    expect(screen.queryByTestId('home-hero-template-clear')).toBeNull();
     expect(screen.queryByTestId('home-hero-template-reset')).toBeNull();
-    // #5517 dropped the explicit "None" placeholder at rest — the gray
-    // "Creation type" kicker alone reads as the empty state, and the label slot
-    // only appears once a template is selected.
-    expect(screen.getByTestId('home-hero-template-trigger').textContent).toContain('Creation type');
+  });
+});
+
+describe('TemplatePicker — the sub-type row cannot move the pill', () => {
+  // The pill used to retitle itself to the picked sub-category, so browsing the
+  // sub-type row relabelled and resized the composer's own row under the
+  // cursor (per product: 切换二级目录时输入框的绿色按钮不要动). The category is
+  // not part of this component's inputs at all any more — the only thing that
+  // can change the pill is changing the TYPE.
+  it('names the type, never a sub-category', () => {
+    const { rerender } = render(
+      <TemplatePicker
+        templates={templates}
+        activeChipId="prototype"
+        onClearTemplate={vi.fn()}
+        labelFor={labelFor}
+      />,
+    );
+    const pillText = screen.getByTestId('home-hero-template-trigger').textContent;
+    expect(pillText).toContain(labelFor('prototype'));
+
+    // Everything a sub-category pick changes in the host (its own selection
+    // state) leaves this component's props untouched, so the pill re-renders
+    // identically.
+    rerender(
+      <TemplatePicker
+        templates={templates}
+        activeChipId="prototype"
+        onClearTemplate={vi.fn()}
+        labelFor={labelFor}
+      />,
+    );
+    expect(screen.getByTestId('home-hero-template-trigger').textContent).toBe(pillText);
+  });
+
+  it('offers one clear, and it gives up the template', () => {
+    const onClearTemplate = vi.fn();
+    render(
+      <TemplatePicker
+        templates={templates}
+        activeChipId="prototype"
+        onClearTemplate={onClearTemplate}
+        labelFor={labelFor}
+      />,
+    );
+
+    // The progressive "first × drops the category, second drops the type" pair
+    // went away with the retitling that made it legible.
+    expect(screen.queryByTestId('home-hero-template-clear-subtype')).toBeNull();
+    fireEvent.click(screen.getByTestId('home-hero-template-clear'));
+    expect(onClearTemplate).toHaveBeenCalledTimes(1);
   });
 });
