@@ -706,7 +706,19 @@ describe('ProjectView auto-open settle watcher lifecycle', () => {
   }
 
   // Positive control for the per-write guard below.
-  it('opens from a delayed per-write refresh while the run still owns auto-open', async () => {
+  it('does not open from a per-write refresh that settles after the live-focus window closed', async () => {
+    // Upstream (`liveFocusClosed`, added to the per-write continuation after
+    // this branch was first reviewed) rules that once a run's live-focus
+    // window closes, a Write refresh that settles afterwards must not take the
+    // preview. This branch does not relitigate that: it keeps the guard and
+    // leaves the late-landing case to the settle watcher, whose positive
+    // control is `opens the generated file once a later list settles and focus
+    // has not moved` at the top of this file.
+    //
+    // Pinned as a test rather than left implicit because the run fence this
+    // branch adds sits on the same path: if someone later drops
+    // `liveFocusClosed` to make the fence the only gate, this goes red and
+    // says which rule was removed.
     const turn = await runTurnHoldingPerWriteRead({
       projectId: 'project-per-write-control',
       tabs: { tabs: ['notes.md'], active: 'notes.md' },
@@ -717,9 +729,16 @@ describe('ProjectView auto-open settle watcher lifecycle', () => {
 
     await turn.releasePerWriteRead();
 
-    expect(openRequestKeys().map((key) => key.name)).toContain('turn-a.html');
+    expect(openRequestKeys().map((key) => key.name)).not.toContain('turn-a.html');
   });
 
+  // NOTE (2026-09-20, merging upstream): upstream's `liveFocusClosed` now also
+  // blocks this path, so this assertion and the one further down no longer
+  // isolate the run fence — they would hold with the fence removed. Kept
+  // because they still document what the fence is for and would catch a
+  // regression in which BOTH gates are lost; the fence's own coverage while
+  // the run is still live is the superseded-run tests on the completion and
+  // persistence paths.
   it('does not let a delayed per-write refresh focus a superseded run', async () => {
     // Reviewer #6842 (nettee, 2026-08-14): this callback is guarded only by the
     // run-local `completionSelectedAutoOpen`, which a newer turn cannot flip.
@@ -902,64 +921,24 @@ describe('ProjectView auto-open settle watcher lifecycle', () => {
     expect(openRequestKeys().slice(openedBeforeRelease)).toEqual([]);
   });
 
-  it('upgrades to the settled artifact after a delayed per-write open of the same run', async () => {
-    // Reviewer #6842 (nettee, 2026-08-17): the watcher's focus-move guard was
-    // handed only the files the COMPLETION continuation opened. A per-write
-    // refresh that settles after terminal handoff opens its file through the
-    // same run fence, so `plan.md` is this run's own activation — but it was
-    // absent from the snapshot, so when `index.html` settled the guard read
-    // focus as "the user moved on" and retired instead of upgrading. The bug
-    // this PR exists to fix, re-entering through the fix's own bookkeeping.
-    const PLAN = projectFile('plan.md', 'text', turnStart + 10);
-
-    const turn = await runTurnHoldingPerWriteRead({
-      projectId: 'project-per-write-then-settle',
-      tabs: { tabs: ['notes.md'], active: 'notes.md' },
-      preTurn: [NOTES, OTHER],
-      postRun: [NOTES, OTHER, RUN_LOG],
-      writePath: 'plan.md',
-      // The agent writes the deliverable too, but no list has caught up with
-      // it by turn end — the situation the settle watcher exists for.
-      alsoWritePaths: ['index.html'],
-      // The released per-write read carries only the support file, so it is
-      // what moves focus; `index.html` lands afterwards.
-      perWriteSettled: [NOTES, OTHER, RUN_LOG, PLAN],
-      settled: [NOTES, OTHER, RUN_LOG, PLAN, INDEX],
-    });
-
-    await turn.releasePerWriteRead();
-    // Polled rather than asserted on the tick after the release: the release
-    // awaits a fixed number of microtasks, which is not a guarantee that the
-    // continuation behind it has reached its open. Under full-suite load that
-    // raced, and the failure looked like "the guard blocked it" rather than
-    // "the assertion ran early" — the two are indistinguishable from an empty
-    // list, which cost real debugging time.
-    //
-    // The default 1s poll window was still not enough: this chain crosses a
-    // fire-and-forget per-write refresh, so under full-suite load it went red
-    // roughly one run in three while passing every time the file ran alone.
-    // The bound is here only so a genuine hang cannot run forever; nothing on
-    // this path is expected to take anywhere near that long.
-    await waitFor(
-      () => expect(openRequestKeys().map((key) => key.name)).toContain('plan.md'),
-      { timeout: 10_000 },
-    );
-
-    // The workspace follows the open request, exactly as it would in the app.
-    await act(async () => {
-      latestWorkspaceProps().onTabsStateChange?.({
-        tabs: ['notes.md', 'plan.md'],
-        active: 'plan.md',
-      });
-    });
-
-    await landSettledFileList();
-    await landSettledFileList();
-
-    expect(openRequestKeys().map((key) => key.name)).toContain('index.html');
-    // The 10s poll bound above is only reachable if the test itself outlives
-    // it; the default 5s case timeout used to fire first and report a hang.
-  }, 20_000);
+  // The component-level companion to the two per-write guards above used to
+  // live here: a delayed per-write refresh opened `plan.md` through the run
+  // fence, and the watcher then had to read that as its OWN activation rather
+  // than as the user moving on, so it could still upgrade to `index.html` when
+  // the deliverable settled (reviewer #6842, nettee, 2026-08-17).
+  //
+  // Removed rather than rewritten. Upstream's `liveFocusClosed` means a
+  // per-write refresh settling after the live-focus window can no longer open
+  // anything, so the scenario has no vehicle left at this level: every other
+  // way of staging the run's own earlier activation also settles the watch in
+  // the same pass, which is a different situation from the one under test.
+  //
+  // The contract itself is not uncovered — it is pinned directly on the
+  // decision function in `auto-open-file.test.ts`:
+  // `keeps upgrading while every activation since turn end was the run’s own`
+  // asserts `openFileName: 'index.html'` for exactly this input shape
+  // (`turnOwnedFileNames` holding `plan.md`, focus on `plan.md`, activation
+  // count unchanged since turn end), alongside the two retirement cases.
 
   // Drives one turn to terminal status with no produced files but a standalone
   // HTML answer, so the completion path falls through to `persistArtifact`, and
