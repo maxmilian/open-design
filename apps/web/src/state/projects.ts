@@ -2,29 +2,39 @@
 // daemon's SQLite store. All writes round-trip through HTTP so projects
 // stay coherent across multiple browser tabs and across restarts.
 //
-// These helpers fail soft (returning null / [] on transport errors) so
-// the UI can stay rendered when the daemon is briefly unreachable.
+// Most helpers fail soft (returning null / [] on transport errors) so the UI
+// can stay rendered when the daemon is briefly unreachable. Reads whose empty
+// result changes behavior must preserve failure as a typed error instead.
 
 import { coalescedGet, evictCoalescedGet } from '../lib/coalesced-get';
+import { isDaemonProxyConnectionFailure } from '../runtime/daemon-proxy-failure';
 import { BackoffController, type BackoffOptions } from '../lib/backoff';
 import { markProjectCreatedByViewer } from '../collab/useProjectCollab';
-import { API_ERROR_CODES, type ApiErrorCode } from '@open-design/contracts';
+import {
+  API_ERROR_CODES,
+  isSameWorkspacePrincipal,
+  type ApiErrorCode,
+} from '@open-design/contracts';
 import type {
   AppliedPluginSnapshot,
   ApplyResult,
   ChatSessionMode,
+  CollabProjectBootstrapResponse,
   CreateConversationRequest,
   CreateDesignSystemProjectFromProjectResponse,
+  CreateProjectExampleReference,
   DuplicateProjectResponse,
   CreatePluginShareProjectResponse,
   CreateTerminalRequest,
   ImportFolderRequest,
   ImportFolderResponse,
   InstalledPluginRecord,
+  LocalCatalogScope,
   PluginDuplicateProjectResponse,
   PluginInstallOutcome,
   PluginShareAction,
   ProjectPluginFolderInstallRequest,
+  ProjectScenarioTaskProfile,
   ProjectVisibility,
   ProjectWorkspaceScopeResponse,
   TerminalSession,
@@ -93,7 +103,7 @@ export type WorkspaceContextForWrite = {
   context: WorkspaceCollabContext | null;
   loading: boolean;
   identityChangePending?: boolean;
-  failure?: 'unsupported' | 'unavailable';
+  failure?: 'unsupported' | 'unavailable' | 'reauth-required';
   /**
    * The directory-verified identity the retained `context` was resolved under,
    * carrying the generation token it belongs to. Present on production state
@@ -139,13 +149,11 @@ export type WorkspaceContextWriteResolutionOptions = {
  * When the read is momentarily blocked (loading, a pending identity change, or
  * a transient `unavailable` outage) but the shell still holds a directory-
  * verified last-good context that belongs to the CURRENT identity generation,
- * that context is honored instead of throwing. The daemon re-verifies the
- * claimed identity on the write (`authorizeCreatedProjectWorkspace`: valid →
- * allow, cross-workspace → 403, authority down → 503 retryable), so a
- * client-side fail-closed here is a redundant second lock that, under a flaky
- * network, only turns a create the server would have honored into a dead
- * button + retry storm. A context from a RETIRED generation (an account switch
- * bumped the token) still fails closed — that is the cross-account guard.
+ * that context is honored instead of throwing. Remote mutation routes still
+ * re-verify authority at their network boundary; ordinary `POST /api/projects`
+ * is deliberately local-first and no longer uses this helper or performs that
+ * verification. A context from a RETIRED generation (an account switch bumped
+ * the token) still fails closed — that is the cross-account guard.
  */
 export function resolvedWorkspaceContextForWrite(
   state: WorkspaceContextForWrite,
@@ -155,6 +163,7 @@ export function resolvedWorkspaceContextForWrite(
     state.loading
     || state.identityChangePending === true
     || state.failure === 'unavailable'
+    || state.failure === 'reauth-required'
   ) {
     if (writeContextBelongsToCurrentGeneration(state)) return state.context;
     if (options.unavailablePolicy === 'unscoped') return null;
@@ -370,6 +379,18 @@ export type ProjectRouteBootstrapResult =
   | { kind: 'forbidden' }
   | { kind: 'unavailable' };
 
+export type FirstOpenTeamProjectBootstrapResult =
+  | {
+      kind: 'found';
+      project: Project;
+      scope: ProjectWorkspaceScopeResponse['scope'];
+      resolvedDir: string | null;
+      awaitingFirstMaterialization: boolean;
+    }
+  | { kind: 'not-found' }
+  | { kind: 'forbidden' }
+  | { kind: 'unavailable' };
+
 /**
  * Bootstrap a fresh project deep link without borrowing the shell's ambient
  * Workspace. A card-opening witness goes straight through the scoped endpoint;
@@ -417,7 +438,14 @@ export async function bootstrapProjectRoute(
         if (
           !context
           || body.scope.workspaceId !== suppliedContext.workspaceId
-          || workspaceIdentityCacheKey(context) !== suppliedIdentity
+          // Re-confirmation asks WHO, so it compares principals, not cache keys.
+          // The witness comes from the shell and carries the member's real role;
+          // the daemon's scope route answers with its placeholder `member` on
+          // its single branch. Demanding those agree meant a workspace owner's
+          // own project was never re-confirmed — `forbidden` here becomes
+          // `failure: 'missing'` in App with no fallback, so opening a team
+          // project from its directory card reported "项目不存在".
+          || !isSameWorkspacePrincipal(context, suppliedContext)
         ) {
           // A caller-supplied witness is exact authority, never a hint. If the
           // daemon cannot re-confirm it, do not retry this project headerless or
@@ -505,6 +533,92 @@ export async function bootstrapProjectRoute(
   return result;
 }
 
+/**
+ * Progressive first-open lane for a Team project that is present in the hub
+ * but absent from this daemon's local data root.
+ *
+ * `/collab/bootstrap` owns the exact-directory authorization, shared-owner
+ * discovery, placeholder stamp, and background single-flight pull. Its
+ * idempotent PUT is safely replayable by the sidecar proxy after a reused
+ * keep-alive socket resets. A current daemon atomically binds the placeholder
+ * to this exact Team principal before answering; the follow-up route bootstrap
+ * proves that local binding through the ordinary scope/detail gates before
+ * ProjectView may mount.
+ * Older daemons leave the row unbound, which deliberately returns `unavailable`
+ * so App keeps the pre-existing full-materialization fallback.
+ */
+export async function bootstrapFirstOpenTeamProjectRoute(
+  projectId: string,
+  options: {
+    accountGeneration: number;
+    exactContext: WorkspaceCollabContext;
+  },
+): Promise<FirstOpenTeamProjectBootstrapResult> {
+  const { exactContext } = options;
+  if (
+    exactContext.workspaceType !== 'team'
+    || exactContext.memberStatus !== 'active'
+    || exactContext.lifecycleState !== 'active'
+  ) {
+    return { kind: 'not-found' };
+  }
+  let bootstrapResponse: CollabProjectBootstrapResponse;
+  try {
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(projectId)}/collab/bootstrap`,
+      {
+        method: 'PUT',
+        cache: 'no-store',
+        headers: workspaceProjectHeaders(exactContext),
+      },
+    );
+    if (!response.ok) {
+      if (response.status === 403) return { kind: 'forbidden' };
+      if (response.status === 404) return { kind: 'not-found' };
+      return { kind: 'unavailable' };
+    }
+    bootstrapResponse = (await response.json()) as CollabProjectBootstrapResponse;
+  } catch {
+    return { kind: 'unavailable' };
+  }
+  // The optimistic route read immediately before this helper may have cached
+  // the expected 404 for the same exact principal. The successful PUT changed
+  // local authority state, so that negative read is no longer reusable.
+  evictCoalescedGet([
+    'project-route-bootstrap',
+    options.accountGeneration,
+    projectId,
+    workspaceIdentityCacheKey(exactContext),
+  ].join(':'));
+  const bootstrap = await bootstrapProjectRoute(projectId, {
+    accountGeneration: options.accountGeneration,
+    exactContext,
+  });
+  if (bootstrap.kind === 'forbidden') return { kind: 'unavailable' };
+  if (bootstrap.kind !== 'found') return bootstrap;
+  if (
+    bootstrap.scope.kind !== 'team'
+    || bootstrap.scope.context?.workspaceType !== 'team'
+    // Same question, same answer as the re-confirmation above: does this local
+    // binding belong to the exact principal that authorized the bootstrap? The
+    // daemon's scope placeholder role is not evidence about that, and letting it
+    // decide killed this progressive first-open lane outright for every
+    // owner/admin — every first open silently fell back to the slow
+    // full-materialization path.
+    || !isSameWorkspacePrincipal(bootstrap.scope.context, exactContext)
+  ) {
+    // A shared placeholder must never be rendered through an unbound/local or
+    // mismatched principal, including when the web is paired with an older
+    // daemon that only registered a row without its Team binding.
+    return { kind: 'unavailable' };
+  }
+  return {
+    ...bootstrap,
+    awaitingFirstMaterialization:
+      bootstrapResponse.awaitingFirstMaterialization === true,
+  };
+}
+
 export async function getProjectDetail(
   id: string,
   opts?: { ensureDir?: boolean },
@@ -557,26 +671,59 @@ function defaultRetrySleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+
 /** Parse a create/write error body into a UI message + the retryable flag. */
 async function readWorkspaceWriteError(
   resp: Response,
   fallbackMessage: string,
-): Promise<{ message: string; retryable: boolean }> {
+): Promise<{
+  message: string;
+  retryable: boolean;
+  code: ApiErrorCode | null;
+  requestId: string | null;
+}> {
   let message = fallbackMessage;
   let retryable = false;
+  let code: ApiErrorCode | null = null;
+  let requestId: string | null = null;
   try {
     const body = (await resp.json()) as { error?: unknown };
     if (body.error && typeof body.error === 'object') {
-      const error = body.error as { message?: unknown; retryable?: unknown };
+      const error = body.error as {
+        code?: unknown;
+        message?: unknown;
+        requestId?: unknown;
+        retryable?: unknown;
+      };
       if (typeof error.message === 'string' && error.message.trim()) {
         message = error.message;
       }
       if (error.retryable === true) retryable = true;
+      if (
+        typeof error.code === 'string'
+        && (API_ERROR_CODES as readonly string[]).includes(error.code)
+      ) code = error.code as ApiErrorCode;
+      if (typeof error.requestId === 'string' && error.requestId.trim()) {
+        requestId = error.requestId;
+      }
     }
   } catch {
     // Keep the generic fallback when the error body is absent or invalid.
   }
-  return { message, retryable };
+  return { message, retryable, code, requestId };
+}
+
+export class ProjectCreateError extends Error {
+  constructor(
+    message: string,
+    readonly status: number | null,
+    readonly code: ApiErrorCode | null,
+    readonly retryable: boolean,
+    readonly requestId: string | null,
+  ) {
+    super(message);
+    this.name = 'ProjectCreateError';
+  }
 }
 
 /**
@@ -596,7 +743,9 @@ export async function createProject(
     name: string;
     projectLocationId?: string;
     skillId: string | null;
+    skillCatalogScope?: LocalCatalogScope | null;
     designSystemId: string | null;
+    designSystemCatalogScope?: LocalCatalogScope | null;
     pendingPrompt?: string;
     metadata?: ProjectMetadata;
     conversationMode?: ChatSessionMode;
@@ -604,8 +753,16 @@ export async function createProject(
     // (or pre-applied snapshot id) to resolve and pin a plugin to the new
     // project. Used by the PluginLoopHome flow on Home.
     pluginId?: string;
+    pluginSource?: string;
     appliedPluginSnapshotId?: string;
     pluginInputs?: Record<string, unknown>;
+    automaticStrategyTaskProfile?: ProjectScenarioTaskProfile;
+    /**
+     * Identity of the official example card the user picked under an automatic
+     * OD Next route. A claim, not content: the daemon re-resolves it through
+     * the local catalogue. Never accompanies `pluginId`/`appliedPluginSnapshotId`.
+     */
+    exampleReference?: CreateProjectExampleReference;
     workspaceContext?: WorkspaceCollabContext | null;
   },
   retryOptions: CreateProjectRetryOptions = {},
@@ -617,7 +774,7 @@ export async function createProject(
   );
   try {
     // `randomUUID` falls back to `crypto.getRandomValues` / `Math.random`
-    // when `crypto.randomUUID` is unavailable. Open Design served over
+    // when `crypto.randomUUID` is unavailable. OpenDesign served over
     // plain HTTP on a LAN IP (Docker / unRAID self-hosting) is a
     // non-secure context, where `crypto.randomUUID` is undefined and
     // calling it directly throws — the surrounding try/catch then turns
@@ -649,7 +806,16 @@ export async function createProject(
         markProjectCreatedByViewer(created.project.id, input.workspaceContext ?? null);
         return created;
       }
-      const { message, retryable } = await readWorkspaceWriteError(
+      if (await isDaemonProxyConnectionFailure(resp)) {
+        throw new ProjectCreateError(
+          'Could not reach the local OpenDesign service',
+          null,
+          null,
+          true,
+          null,
+        );
+      }
+      const { message, retryable, code, requestId } = await readWorkspaceWriteError(
         resp,
         'Could not create project',
       );
@@ -657,7 +823,7 @@ export async function createProject(
         await sleep(backoff.nextDelay());
         continue;
       }
-      throw new Error(message);
+      throw new ProjectCreateError(message, resp.status, code, retryable, requestId);
     }
   } catch (err) {
     throw err instanceof Error ? err : new Error('Could not create project');
@@ -830,12 +996,47 @@ export async function importClaudeDesignZip(
 
 // ---------- templates ----------
 
+/**
+ * Bumped by every successful local template mutation, and part of the read key.
+ *
+ * `ttl = 0` stops a settled result from being reused; it does not stop a new
+ * caller from JOINING a request that is still in flight — and the caller that
+ * follows a mutation is exactly the one that must not join. `handleDeleteTemplate`
+ * awaits `deleteTemplate` and then refreshes, and the daemon answers
+ * `/api/templates` from a snapshot taken when the request arrived, so joining a
+ * pre-delete GET would leave the deleted template on screen until something
+ * else happened to refetch.
+ */
+let templateListMutationGeneration = 0;
+
+function noteTemplateListMutation(): void {
+  templateListMutationGeneration += 1;
+}
+
 export async function listTemplates(): Promise<ProjectTemplate[]> {
+  // Same launch-burst shape as the design-system catalog: App's one-shot
+  // bootstrap and the home-route effect both want this list on the same pass,
+  // and both must keep their own read — one settles the entry view, the other
+  // exists to pick up a template saved inside a project. Neither can drop its
+  // read; on the wire they are one request, and on a cold Home load they land
+  // together and take two of the browser's ~6 connection slots.
+  //
+  // SINGLE-FLIGHT ONLY (ttl 0). The home-route effect and the save handler's
+  // own refresh both exist to observe a change that just happened, so a shared
+  // settled answer would hand them the list they were fired to replace.
+  //
+  // One global key, deliberately not partitioned by Workspace identity: the
+  // daemon handler ignores the request entirely (`(_req, res) =>`) and answers
+  // from its local store, so this response cannot vary by caller identity.
+  // Throwing inside keeps a transient failure out of the shared entry, so the
+  // next caller retries instead of joining a dead read.
   try {
-    const resp = await fetch('/api/templates');
-    if (!resp.ok) return [];
-    const json = (await resp.json()) as { templates: ProjectTemplate[] };
-    return json.templates ?? [];
+    return await coalescedGet(`project-templates:${templateListMutationGeneration}`, async () => {
+      const resp = await fetch('/api/templates');
+      if (!resp.ok) throw new Error(`templates ${resp.status}`);
+      const json = (await resp.json()) as { templates: ProjectTemplate[] };
+      return json.templates ?? [];
+    }, 0);
   } catch {
     return [];
   }
@@ -864,6 +1065,7 @@ export async function saveTemplate(input: {
       body: JSON.stringify(input),
     });
     if (!resp.ok) return null;
+    noteTemplateListMutation();
     const json = (await resp.json()) as { template: ProjectTemplate };
     return json.template;
   } catch {
@@ -876,6 +1078,7 @@ export async function deleteTemplate(id: string): Promise<boolean> {
     const resp = await fetch(`/api/templates/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     });
+    if (resp.ok) noteTemplateListMutation();
     return resp.ok;
   } catch {
     return false;
@@ -1190,28 +1393,107 @@ export async function deleteConversation(
 
 // ---------- messages ----------
 
+/**
+ * A failed authoritative transcript read. Callers must not reinterpret this
+ * as an empty conversation: Home auto-send and recovery flows make decisions
+ * from that distinction.
+ */
+export class ProjectMessageListError extends Error {
+  constructor(
+    message: string,
+    readonly status: number | null,
+    readonly code: string | null,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = 'ProjectMessageListError';
+  }
+}
+
+async function readProjectMessageListError(resp: Response): Promise<{
+  message: string;
+  code: string | null;
+  retryable: boolean;
+}> {
+  let message = `Could not load messages for this conversation (${resp.status}).`;
+  let code: string | null = null;
+  // Legacy errors and proxy failures may omit a retryability hint. This is a
+  // read, so transient HTTP statuses can use the caller's bounded retry policy.
+  let retryable = resp.status === 408
+    || resp.status === 429
+    || (resp.status >= 500 && resp.status <= 599);
+  try {
+    const payload = await resp.json() as {
+      retryable?: unknown;
+      error?: string | {
+        code?: unknown;
+        message?: unknown;
+        retryable?: unknown;
+      };
+    };
+    if (typeof payload.retryable === 'boolean') retryable = payload.retryable;
+    if (payload.error && typeof payload.error === 'object') {
+      const rawCode = payload.error.code;
+      code = typeof rawCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/u.test(rawCode)
+        ? rawCode
+        : null;
+      if (typeof payload.error.message === 'string' && payload.error.message.trim()) {
+        message = payload.error.message;
+      }
+      if (typeof payload.error.retryable === 'boolean') {
+        retryable = payload.error.retryable;
+      }
+    } else if (typeof payload.error === 'string' && payload.error.trim()) {
+      message = payload.error;
+    }
+  } catch {
+    // Keep the stable HTTP fallback for legacy/non-JSON responses.
+  }
+  return { message, code, retryable };
+}
+
 export async function listMessages(
   projectId: string,
   conversationId: string,
   workspaceContext?: WorkspaceCollabContext | null,
+  signal?: AbortSignal,
 ): Promise<ChatMessage[]> {
   try {
     const resp = await fetch(
       `/api/projects/${encodeURIComponent(projectId)}/conversations/${encodeURIComponent(conversationId)}/messages`,
-      workspaceContext
-        ? { headers: workspaceProjectHeaders(workspaceContext) }
+      workspaceContext || signal
+        ? {
+            ...(workspaceContext ? { headers: workspaceProjectHeaders(workspaceContext) } : {}),
+            ...(signal ? { signal } : {}),
+          }
         : undefined,
     );
-    if (!resp.ok) return [];
+    if (!resp.ok) {
+      const failure = await readProjectMessageListError(resp);
+      throw new ProjectMessageListError(
+        failure.message,
+        resp.status,
+        failure.code,
+        failure.retryable,
+      );
+    }
     const json = (await resp.json()) as { messages: ChatMessage[] };
     return json.messages ?? [];
-  } catch {
-    return [];
+  } catch (error) {
+    if (error instanceof ProjectMessageListError) throw error;
+    throw new ProjectMessageListError(
+      error instanceof Error ? error.message : 'Could not load messages for this conversation.',
+      null,
+      null,
+      true,
+    );
   }
 }
 
 export interface SaveMessageOptions {
   telemetryFinalized?: boolean;
+  /** Claim the row once: the daemon keeps an existing row and returns it. */
+  createOnly?: boolean;
   workspaceContext?: WorkspaceCollabContext | null;
   // Set during page-unload paths (pagehide / visibilitychange→hidden) so
   // the in-flight PUT survives even if the document tears down before the
@@ -1225,12 +1507,14 @@ export async function saveMessage(
   conversationId: string,
   message: ChatMessage,
   options: SaveMessageOptions = {},
-): Promise<void> {
+): Promise<ChatMessage | null> {
   try {
-    const body = options.telemetryFinalized
-      ? { ...message, telemetryFinalized: true }
-      : message;
-    await fetch(
+    const body = {
+      ...message,
+      ...(options.telemetryFinalized ? { telemetryFinalized: true } : {}),
+      ...(options.createOnly ? { createOnly: true } : {}),
+    };
+    const response = await fetch(
       `/api/projects/${encodeURIComponent(projectId)}/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(message.id)}`,
       {
         method: 'PUT',
@@ -1244,8 +1528,14 @@ export async function saveMessage(
         ...(options.keepalive ? { keepalive: true } : {}),
       },
     );
+    if (!response.ok) return null;
+    // The stored row, which a create-only claim may have kept from an earlier
+    // writer. Callers that care compare it against what they sent.
+    const saved = (await response.json()) as { message?: ChatMessage };
+    return saved.message ?? null;
   } catch {
     // best-effort persistence — UI keeps the message in-memory either way
+    return null;
   }
 }
 
@@ -1573,9 +1863,10 @@ export async function persistTabsToDaemonNow(
 // Plan §3.C1 — plugin discovery + apply.
 //
 // applyPlugin() is the canonical entry point for both the inline rail
-// (NewProjectPanel + ChatComposer) and the marketplace detail page. It
-// hits POST /api/plugins/:id/apply, which is the same pure resolver
-// the daemon uses; the response carries everything the composer needs:
+// (NewProjectPanel + ChatComposer) and the marketplace detail page. A caller
+// with a catalogue record supplies its exact local source; id-only callers
+// retain the Workspace-scoped compatibility route. Both return everything the
+// composer needs:
 //   - query (pre-filled brief)
 //   - contextItems (chip strip)
 //   - inputs (form fields)
@@ -1653,6 +1944,16 @@ export async function listPlugins(
   const cacheKey = pluginCatalogCacheKey(options);
   const requestGeneration = (pluginCatalogCacheGenerations.get(cacheKey) ?? 0) + 1;
   pluginCatalogCacheGenerations.set(cacheKey, requestGeneration);
+  // NOT single-flighted, deliberately. `FileWorkspace`'s load effect fires this
+  // twice ~4ms apart on a cold conversation open, and a ttl-0 join would remove
+  // the second request — but it would also remove the ordinary same-key request
+  // race that `pluginCatalogCacheGenerations` above exists to arbitrate, and
+  // that `tests/state/projects.test.ts` pins ("keeps the latest-started
+  // same-scope plugin read cached when responses finish in reverse order").
+  // Collapsing identical concurrent reads makes that race unreachable rather
+  // than merely handled, which is a change to this module's stated concurrency
+  // contract, not a request-count change. Left for the owner of that contract
+  // to decide.
   try {
     const resp = await fetch(
       '/api/plugins',
@@ -2036,8 +2337,8 @@ export type PluginShareProjectOutcome =
  * `workspaceContext` MUST be attached, for the same reason every sibling create
  * in this file attaches it: the project this endpoint creates gets a
  * `workspace_projects` binding from the request's own identity, and a headerless
- * create leaves it unbound — denied its first run by the daemon's workspace gate
- * and carrying no workspace to bill on any run that does get through. This call
+ * create leaves it unbound — its first run can use the signed-in account wallet,
+ * but it has no pinned Workspace for later Team billing or mutations. This call
  * was the one create in this file with no `workspaceContext` parameter at all,
  * so it was permanently unbound rather than merely racy.
  */
@@ -2430,28 +2731,37 @@ export async function applyPlugin(
     projectId?: string;
     grantCaps?: string[];
     locale?: string;
+    pluginSource?: string;
     workspaceContext?: WorkspaceCollabContext | null;
   } = {},
 ): Promise<ApplyResult | null> {
   try {
-    const resp = await fetch(
-      `/api/plugins/${encodeURIComponent(pluginId)}/apply`,
+    const requestBody = JSON.stringify({
+      ...(options.pluginSource ? { source: options.pluginSource } : {}),
+      inputs: options.inputs ?? {},
+      projectId: options.projectId,
+      grantCaps: options.grantCaps ?? [],
+      locale: options.locale,
+    });
+    const pluginUrl = `/api/plugins/${encodeURIComponent(pluginId)}`;
+    let resp = await fetch(
+      `${pluginUrl}/${options.pluginSource ? 'apply-local' : 'apply'}`,
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(options.workspaceContext
+          ...(!options.pluginSource && options.workspaceContext
             ? workspaceProjectHeaders(options.workspaceContext)
             : {}),
         },
-        body: JSON.stringify({
-          inputs: options.inputs ?? {},
-          projectId: options.projectId,
-          grantCaps: options.grantCaps ?? [],
-          locale: options.locale,
-        }),
+        body: requestBody,
       },
     );
+    // Exact-source requests must never degrade to the legacy ID-only route:
+    // its response cannot prove which same-ID local record it applied. New
+    // daemons still accept old ID-only clients through /apply; during the brief
+    // new-Web/old-daemon upgrade window, omitting the plugin is safer than
+    // silently substituting different local bytes.
     if (!resp.ok) return null;
     const json = (await resp.json()) as ApplyResult & { ok?: boolean };
     return json;

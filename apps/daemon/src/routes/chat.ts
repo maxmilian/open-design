@@ -34,7 +34,7 @@ import {
 import { isSafeId as isSafeProjectId } from '../projects.js';
 import { projectKindToTracking } from '@open-design/contracts/analytics';
 import { proxyDispatcherRequestInit, validateUserProviderBaseUrl } from '../connectionTest.js';
-import { resolveModelForServiceTier } from '../runtimes/models.js';
+import { isKnownReasoningEffort, resolveModelForServiceTier } from '../runtimes/models.js';
 import { googleStreamGenerateContentUrl } from '../integrations/google-models.js';
 import { createRoleMarkerGuard } from '../role-marker-guard.js';
 import { authorizeReasoningEgress, sendReasoningEgressDenial } from '../reasoning-egress.js';
@@ -52,6 +52,8 @@ const FEEDBACK_REASON_ALLOWLIST: ReadonlySet<string> = new Set([
   'followed_design_system',
   'missed_request',
   'weak_visual',
+  'could_not_run',
+  'too_slow',
   'incomplete_output',
   'hard_to_use',
   'missed_design_system',
@@ -373,8 +375,8 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
           const safeReasoning =
             def &&
             typeof body.reasoning === 'string' &&
-            Array.isArray(def.reasoningOptions)
-              ? (def.reasoningOptions.find((r: any) => r.id === body.reasoning)?.id ?? undefined)
+            isKnownReasoningEffort(def, safeModel, body.reasoning)
+              ? body.reasoning
               : undefined;
           safeModel = def
             ? resolveModelForServiceTier(
@@ -1103,7 +1105,7 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
           Authorization: `Bearer ${apiKey}`,
           ...(validated.parsed!.hostname === 'openrouter.ai' ? {
             'HTTP-Referer': 'https://opendesign.dev',
-            'X-Title': 'Open Design',
+            'X-Title': 'OpenDesign',
           } : {}),
         },
         redirect: 'error' as const,

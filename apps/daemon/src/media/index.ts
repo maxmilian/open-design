@@ -54,8 +54,20 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { execFile as execFileCb, spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { Agent as UndiciAgent } from 'undici';
+import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
+import { load as loadHtml } from 'cheerio';
+import { SETTINGS_MEDIA_PROVIDERS_PATH } from '@open-design/contracts';
+import {
+  findRealTagOffset,
+  HTML_TAG_PATTERNS,
+} from '@open-design/contracts/runtime/html-injection-points';
+import type {
+  DesktopRenderFramesInput,
+  DesktopRenderFramesResult,
+} from '@open-design/sidecar-proto';
 import {
   AUDIO_DURATIONS_SEC,
   type AudioKind,
@@ -76,6 +88,11 @@ import {
   fetchImageGenerationWithResponseRetry,
   type ImageGenerationRequestSummary,
 } from './image-generation-retry.js';
+import {
+  resolveHyperFramesBrowserRuntimePath,
+  resolveHyperFramesCliPath,
+  resolveHyperFramesNodeBin,
+} from './hyperframes-runtime.js';
 import { renderVelaImage, renderVelaVideo } from './vela.js';
 import {
   ensureProject,
@@ -96,6 +113,9 @@ const execFile = promisify(execFileCb);
 const DEFAULT_OPENROUTER_VIDEO_POLL_INTERVAL_MS = 8000;
 type ProviderConfig = { apiKey?: string; baseUrl?: string; model?: string };
 type ProgressFn = (message: string) => void;
+type DesktopFrameRenderer = (
+  input: DesktopRenderFramesInput,
+) => Promise<DesktopRenderFramesResult>;
 type ImageRef = { path: string; abs: string; mime: string; size: number; dataUrl: string };
 type MediaRequestInit = Pick<RequestInit, 'dispatcher'>;
 type MediaContext = {
@@ -195,7 +215,7 @@ class StubProviderDisabledError extends Error {
   status = 503;
   constructor(model: string) {
     super(
-      `provider not configured: ${model}. Add your API key in Settings -> Media Providers to enable real generation.`,
+      `provider not configured: ${model}. Add your API key in ${SETTINGS_MEDIA_PROVIDERS_PATH} to enable real generation.`,
     );
     this.name = 'StubProviderDisabledError';
   }
@@ -331,8 +351,29 @@ export async function generateMedia(args: {
   length?: number; duration?: number; voice?: string;
   audioKind?: AudioKind; language?: string; loop?: boolean; promptInfluence?: number;
   compositionDir?: string; image?: string; images?: string[]; onProgress?: ProgressFn; requestInit?: MediaRequestInit;
+  desktopFrameRenderer?: DesktopFrameRenderer | null;
   workspaceId?: string;
   onProviderRequestSettled?: (summary: ImageGenerationRequestSummary & { providerId: string }) => void;
+  /**
+   * Called once with the EXACT provider bytes that were just written, while
+   * they are still in memory.
+   *
+   * This is the strongest capture point in the daemon: the caller receives the
+   * very buffer that produced the file, so an immutable snapshot never has to
+   * re-read a path that the next turn may already have overwritten. The media
+   * layer stays a pure dispatcher — it hands over bytes and a project-relative
+   * name and knows nothing about snapshots, runs, or messages.
+   *
+   * Failures here must never fail the generation, so the caller's rejection is
+   * swallowed by design.
+   */
+  onBytesWritten?: (written: {
+    bytes: Buffer;
+    name: string;
+    mime: string;
+    kind: string;
+    mtime: number;
+  }) => void | Promise<void>;
 }) {
   const {
     projectRoot,
@@ -714,7 +755,12 @@ export async function generateMedia(args: {
       // so puppeteer behaves correctly. Agent-side npx is reserved for
       // the lighter HF subcommands (lint, transcribe, tts) that don't
       // need to spawn Chrome.
-      const result = await renderHyperFramesViaCli(ctx, dir, args.onProgress);
+      const result = await renderHyperFrames(
+        ctx,
+        dir,
+        args.desktopFrameRenderer ?? null,
+        args.onProgress,
+      );
       bytes = result.bytes;
       providerNote = result.providerNote;
       suggestedExt = result.suggestedExt;
@@ -824,6 +870,21 @@ export async function generateMedia(args: {
   const finalTarget = path.join(dir, finalOut);
   await writeFile(finalTarget, bytes);
   const st = await stat(finalTarget);
+  if (args.onBytesWritten) {
+    try {
+      await args.onBytesWritten({
+        bytes,
+        name: finalOut,
+        mime: mimeFor(finalOut),
+        kind: kindFor(finalOut),
+        mtime: st.mtimeMs,
+      });
+    } catch (err) {
+      // A snapshot is evidence, not a precondition. Losing it degrades one
+      // chat card; failing the generation here would lose the file itself.
+      console.warn('[media] onBytesWritten hook failed', err);
+    }
+  }
   return {
     name: finalOut,
     size: st.size,
@@ -893,7 +954,7 @@ function withMediaRequestInit(
 }
 
 const OPENAI_IMAGE_NO_CREDENTIAL_MESSAGE =
-  'no OpenAI credential - configure an API key in Settings or set OPENAI_API_KEY.';
+  `no OpenAI credential — configure an API key in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OPENAI_API_KEY.`;
 
 async function renderOpenAIImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
@@ -983,7 +1044,7 @@ async function renderOpenAIImage(ctx: MediaContext, credentials: ProviderConfig)
 async function renderImageRouterImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no ImageRouter API key — configure it in Settings or set OD_IMAGEROUTER_API_KEY',
+      `no ImageRouter API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_IMAGEROUTER_API_KEY`,
     );
   }
   const baseUrl = (credentials.baseUrl || IMAGEROUTER_DEFAULT_BASE_URL).trim();
@@ -1018,7 +1079,7 @@ async function renderImageRouterImage(ctx: MediaContext, credentials: ProviderCo
 async function renderImageRouterVideo(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no ImageRouter API key — configure it in Settings or set OD_IMAGEROUTER_API_KEY',
+      `no ImageRouter API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_IMAGEROUTER_API_KEY`,
     );
   }
   const baseUrl = (credentials.baseUrl || IMAGEROUTER_DEFAULT_BASE_URL).trim();
@@ -1054,7 +1115,7 @@ async function renderCustomOpenAIImage(ctx: MediaContext, credentials: ProviderC
   const baseUrl = (credentials.baseUrl || '').trim();
   if (!baseUrl) {
     throw new Error(
-      'Custom Image API base URL required — configure an OpenAI-compatible /v1/images/generations or /v1/images/edits endpoint in Settings',
+      `Custom Image API base URL required — configure an OpenAI-compatible /v1/images/generations or /v1/images/edits endpoint in ${SETTINGS_MEDIA_PROVIDERS_PATH}`,
     );
   }
   const wireModel = (
@@ -1063,7 +1124,7 @@ async function renderCustomOpenAIImage(ctx: MediaContext, credentials: ProviderC
   ).trim();
   if (!wireModel) {
     throw new Error(
-      'Custom Image API model required — configure the provider model in Settings',
+      `Custom Image API model required — configure the provider model in ${SETTINGS_MEDIA_PROVIDERS_PATH}`,
     );
   }
 
@@ -1316,7 +1377,7 @@ function openaiSpeechFormatFor(fileName: string): string {
 
 async function renderOpenAISpeech(ctx: MediaContext, credentials: ProviderConfig, fileName: string): Promise<RenderResult> {
   if (!credentials.apiKey) {
-    throw new Error('no OpenAI credential — configure an API key in Settings or set OPENAI_API_KEY');
+    throw new Error(`no OpenAI credential — configure an API key in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OPENAI_API_KEY`);
   }
   const rawBase = credentials.baseUrl || 'https://api.openai.com/v1';
   const azure = detectAzureEndpoint(rawBase);
@@ -1398,7 +1459,7 @@ async function renderOpenAISpeech(ctx: MediaContext, credentials: ProviderConfig
 async function renderVolcengineVideo(ctx: MediaContext, credentials: ProviderConfig, onProgress?: ProgressFn): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no Volcengine Ark API key — configure it in Settings or set ARK_API_KEY',
+      `no Volcengine Ark API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set ARK_API_KEY`,
     );
   }
   const baseUrl = (credentials.baseUrl || 'https://ark.cn-beijing.volces.com/api/v3').replace(/\/$/, '');
@@ -1541,7 +1602,7 @@ function volcengineRatioFor(aspect?: string): string {
 // POST /api/v3/images/generations (OpenAI-compatible payload).
 async function renderVolcengineImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
-    throw new Error('no Volcengine Ark API key — configure it in Settings or set ARK_API_KEY');
+    throw new Error(`no Volcengine Ark API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set ARK_API_KEY`);
   }
   const baseUrl = (credentials.baseUrl || 'https://ark.cn-beijing.volces.com/api/v3').replace(/\/$/, '');
 
@@ -1612,7 +1673,7 @@ async function renderVolcengineImage(ctx: MediaContext, credentials: ProviderCon
 async function renderGrokImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no xAI credentials — sign in with your SuperGrok subscription (in OD or via `hermes auth add xai-oauth`), set XAI_API_KEY, or configure a key in Settings',
+      `no xAI credentials — sign in with your SuperGrok subscription (in OD or via \`hermes auth add xai-oauth\`), set XAI_API_KEY, or configure a key in ${SETTINGS_MEDIA_PROVIDERS_PATH}`,
     );
   }
   const baseUrl = (credentials.baseUrl || 'https://api.x.ai/v1').replace(/\/$/, '');
@@ -1671,7 +1732,7 @@ async function renderNanoBananaImage(ctx: MediaContext, credentials: ProviderCon
   const apiKey = credentials.apiKey;
   if (!apiKey) {
     throw new Error(
-      'no Nano Banana API key — configure it in Settings or set OD_NANOBANANA_API_KEY',
+      `no Nano Banana API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_NANOBANANA_API_KEY`,
     );
   }
 
@@ -1813,7 +1874,7 @@ async function renderOpenRouterImage(
 ): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no OpenRouter API key — configure it in Settings or set OPENROUTER_API_KEY',
+      `no OpenRouter API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OPENROUTER_API_KEY`,
     );
   }
   const baseUrl = (credentials.baseUrl || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
@@ -1860,7 +1921,7 @@ async function renderOpenRouterImage(
       'authorization': `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
       'HTTP-Referer': 'https://opendesign.dev',
-      'X-Title': 'Open Design',
+      'X-Title': 'OpenDesign',
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(Math.max(OPENAI_IMAGE_HEADERS_TIMEOUT_MS, OPENAI_IMAGE_BODY_TIMEOUT_MS)),
@@ -1944,7 +2005,7 @@ async function renderOpenRouterVideo(
 ): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no OpenRouter API key — configure it in Settings or set OPENROUTER_API_KEY',
+      `no OpenRouter API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OPENROUTER_API_KEY`,
     );
   }
   const baseUrl = (credentials.baseUrl || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
@@ -2020,7 +2081,7 @@ async function renderOpenRouterVideo(
       // OpenRouter attribution headers per
       // https://openrouter.ai/docs/app-attribution
       'HTTP-Referer': 'https://opendesign.dev',
-      'X-Title': 'Open Design',
+      'X-Title': 'OpenDesign',
     },
     body: JSON.stringify(body),
   }));
@@ -2076,7 +2137,7 @@ async function renderOpenRouterVideo(
       headers: {
         'authorization': `Bearer ${credentials.apiKey}`,
         'HTTP-Referer': 'https://opendesign.dev',
-        'X-Title': 'Open Design',
+        'X-Title': 'OpenDesign',
       },
     }));
     const pollText = await pollResp.text();
@@ -2173,7 +2234,7 @@ function openRouterAspectFor(aspect?: string): string {
 async function renderLeonardoImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no Leonardo.ai API key — configure it in Settings or set LEONARDO_API_KEY',
+      `no Leonardo.ai API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set LEONARDO_API_KEY`,
     );
   }
   const baseUrl = (credentials.baseUrl || 'https://cloud.leonardo.ai/api/rest/v1').replace(/\/$/, '');
@@ -2302,7 +2363,7 @@ async function renderLeonardoImage(ctx: MediaContext, credentials: ProviderConfi
 async function renderGrokVideo(ctx: MediaContext, credentials: ProviderConfig, onProgress?: ProgressFn): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no xAI credentials — sign in with your SuperGrok subscription (in OD or via `hermes auth add xai-oauth`), set XAI_API_KEY, or configure a key in Settings',
+      `no xAI credentials — sign in with your SuperGrok subscription (in OD or via \`hermes auth add xai-oauth\`), set XAI_API_KEY, or configure a key in ${SETTINGS_MEDIA_PROVIDERS_PATH}`,
     );
   }
   const baseUrl = (credentials.baseUrl || 'https://api.x.ai/v1').replace(/\/$/, '');
@@ -2467,7 +2528,7 @@ const XAI_TTS_DEFAULT_LANGUAGE = 'en';
 async function renderXAITTS(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no xAI credentials — sign in with your SuperGrok subscription (in OD or via `hermes auth add xai-oauth`), set XAI_API_KEY, or configure a key in Settings',
+      `no xAI credentials — sign in with your SuperGrok subscription (in OD or via \`hermes auth add xai-oauth\`), set XAI_API_KEY, or configure a key in ${SETTINGS_MEDIA_PROVIDERS_PATH}`,
     );
   }
   const baseUrl = (credentials.baseUrl || XAI_TTS_DEFAULT_BASE_URL).replace(
@@ -2569,7 +2630,7 @@ function assertElevenLabsSfxPromptLength(text: string) {
 async function renderElevenLabsTTS(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no ElevenLabs API key - configure it in Settings or set OD_ELEVENLABS_API_KEY',
+      `no ElevenLabs API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_ELEVENLABS_API_KEY`,
     );
   }
 
@@ -2622,7 +2683,7 @@ async function renderElevenLabsTTS(ctx: MediaContext, credentials: ProviderConfi
 async function renderElevenLabsSfx(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no ElevenLabs API key - configure it in Settings or set OD_ELEVENLABS_API_KEY',
+      `no ElevenLabs API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_ELEVENLABS_API_KEY`,
     );
   }
 
@@ -2712,7 +2773,7 @@ const MINIMAX_IMAGE_MODEL_MAP = {
 async function renderMinimaxTTS(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no MiniMax API key — configure it in Settings or set OD_MINIMAX_API_KEY',
+      `no MiniMax API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_MINIMAX_API_KEY`,
     );
   }
   const baseUrl = (credentials.baseUrl || MINIMAX_DEFAULT_BASE_URL).replace(
@@ -2820,7 +2881,7 @@ async function renderMinimaxTTS(ctx: MediaContext, credentials: ProviderConfig):
 async function renderMinimaxImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no MiniMax API key — configure it in Settings or set OD_MINIMAX_API_KEY',
+      `no MiniMax API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_MINIMAX_API_KEY`,
     );
   }
   // Base URL precedence:
@@ -2958,7 +3019,7 @@ const SENSEAUDIO_TTS_MODEL_MAP = {
 async function renderSenseAudioTTS(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no SenseAudio API key — configure it in Settings or set OD_SENSEAUDIO_API_KEY',
+      `no SenseAudio API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_SENSEAUDIO_API_KEY`,
     );
   }
   const baseUrl = (credentials.baseUrl || SENSEAUDIO_DEFAULT_BASE_URL).replace(
@@ -3068,7 +3129,7 @@ function senseAudioImageSize(aspect?: string): string {
 async function renderSenseAudioImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no SenseAudio API key — configure it in Settings or set OD_SENSEAUDIO_API_KEY',
+      `no SenseAudio API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_SENSEAUDIO_API_KEY`,
     );
   }
   const baseUrl = (credentials.baseUrl || SENSEAUDIO_DEFAULT_BASE_URL).replace(
@@ -3164,7 +3225,7 @@ async function renderSenseAudioImage(ctx: MediaContext, credentials: ProviderCon
 
 async function renderAIHubMixImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
-    throw new Error('no AIHubMix API key — configure it in Settings or set OD_AIHUBMIX_API_KEY');
+    throw new Error(`no AIHubMix API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_AIHUBMIX_API_KEY`);
   }
   const baseUrl = credentials.baseUrl || AIHUBMIX_DEFAULT_BASE_URL;
   const wireModel = aihubmixWireModel(credentials.model || ctx.wireModel);
@@ -3238,7 +3299,7 @@ async function renderAIHubMixGeminiImage(
   wireModel: string,
 ): Promise<RenderResult> {
   if (!credentials.apiKey) {
-    throw new Error('no AIHubMix API key — configure it in Settings or set OD_AIHUBMIX_API_KEY');
+    throw new Error(`no AIHubMix API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_AIHUBMIX_API_KEY`);
   }
   const aspect = ctx.aspect || '1:1';
   const bytes = await aihubmixGeminiImageBytes(
@@ -3260,7 +3321,7 @@ async function renderAIHubMixGeminiImage(
 
 async function renderAIHubMixTTS(ctx: MediaContext, credentials: ProviderConfig, fileName: string): Promise<RenderResult> {
   if (!credentials.apiKey) {
-    throw new Error('no AIHubMix API key — configure it in Settings or set OD_AIHUBMIX_API_KEY');
+    throw new Error(`no AIHubMix API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_AIHUBMIX_API_KEY`);
   }
   const baseUrl = credentials.baseUrl || AIHUBMIX_DEFAULT_BASE_URL;
   const wireModel = aihubmixWireModel(credentials.model || ctx.wireModel);
@@ -3316,7 +3377,7 @@ async function renderAIHubMixVideo(
   onProgress?: ProgressFn,
 ): Promise<RenderResult> {
   if (!credentials.apiKey) {
-    throw new Error('no AIHubMix API key — configure it in Settings or set OD_AIHUBMIX_API_KEY');
+    throw new Error(`no AIHubMix API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_AIHUBMIX_API_KEY`);
   }
   const baseUrl = (credentials.baseUrl || AIHUBMIX_DEFAULT_BASE_URL).replace(/\/$/, '');
   const wireModel = aihubmixWireModel(credentials.model || ctx.wireModel);
@@ -3477,7 +3538,7 @@ const FISHAUDIO_TTS_MODEL_MAP = {
 async function renderFishAudioTTS(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
-      'no FishAudio API key — configure it in Settings or set OD_FISHAUDIO_API_KEY',
+      `no FishAudio API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set OD_FISHAUDIO_API_KEY`,
     );
   }
   const baseUrl = (credentials.baseUrl || FISHAUDIO_DEFAULT_BASE_URL).replace(
@@ -3694,7 +3755,7 @@ function falQueueBase(baseUrl: string): string {
 
 async function renderFalImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
-    throw new Error('no Fal API key — configure it in Settings or set FAL_KEY');
+    throw new Error(`no Fal API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set FAL_KEY`);
   }
   const queueBase = falQueueBase((credentials.baseUrl || 'https://fal.run').replace(/\/$/, ''));
   const endpoint = FAL_ENDPOINTS[ctx.model] ?? ctx.model;
@@ -3735,7 +3796,7 @@ async function renderFalImage(ctx: MediaContext, credentials: ProviderConfig): P
 
 async function renderFalVideo(ctx: MediaContext, credentials: ProviderConfig, onProgress?: ProgressFn): Promise<RenderResult> {
   if (!credentials.apiKey) {
-    throw new Error('no Fal API key — configure it in Settings or set FAL_KEY');
+    throw new Error(`no Fal API key — configure it in ${SETTINGS_MEDIA_PROVIDERS_PATH} or set FAL_KEY`);
   }
   const queueBase = falQueueBase((credentials.baseUrl || 'https://fal.run').replace(/\/$/, ''));
   const endpoint = FAL_ENDPOINTS[ctx.model] ?? ctx.model;
@@ -3802,22 +3863,22 @@ async function renderFalVideo(ctx: MediaContext, credentials: ProviderConfig, on
 // with a GSAP timeline) into a hidden cache dir under the project, then
 // dispatches here with `--composition-dir <relative-path>`.
 //
-// We run `npx hyperframes render <absolutePath> --output <tmp>/render.mp4`
-// from the daemon process (NOT the agent's shell) for two reasons:
-//   1. HyperFrames spawns a puppeteer-controlled Chrome to capture frames.
-//      Claude Code's Bash tool wraps subprocesses in macOS sandbox-exec,
-//      under which Chrome hangs partway through frame capture.
-//   2. Pointing --output at a temp dir keeps HF's auto-created
-//      `work-<uuid>/` (per-frame jpegs + intermediate compiled HTML)
-//      OUT of the project folder. We delete the temp tree in the
-//      `finally` block; only the final mp4 bytes are returned to the
-//      generic dispatcher flow, which writes them into the project dir
-//      under the user-supplied filename.
+// Packaged rendering uses the Electron Chromium already shipped with Open
+// Design. Desktop captures deterministic PNG frames through its hidden render
+// window/CDP path; daemon encodes them to MP4 with the bundled FFmpeg binary.
+// An explicitly configured HYPERFRAMES_BROWSER_PATH retains a headless escape
+// hatch for daemon-only development, but packaged clients never download or
+// require a second Chrome installation.
 // ---------------------------------------------------------------------------
 
 const HYPERFRAMES_RENDER_TIMEOUT_MS = 5 * 60 * 1000;
 
-async function renderHyperFramesViaCli(ctx: MediaContext, projectDir: string, onProgress?: ProgressFn): Promise<RenderResult> {
+async function renderHyperFrames(
+  ctx: MediaContext,
+  projectDir: string,
+  desktopFrameRenderer: DesktopFrameRenderer | null,
+  onProgress?: ProgressFn,
+): Promise<RenderResult> {
   const compRel = ctx.compositionDir;
   if (typeof compRel !== 'string' || !compRel.trim()) {
     throw new Error(
@@ -3859,13 +3920,13 @@ async function renderHyperFramesViaCli(ctx: MediaContext, projectDir: string, on
     compAbs,
     compRel,
     'hyperframes.json',
-    'Run `npx hyperframes init "$OD_PROJECT_DIR/$COMP_REL" --example blank --skip-skills --non-interactive` before editing the composition.',
+    'Run `"$OD_NODE_BIN" "$OD_BIN" media scaffold --project "$OD_PROJECT_ID" --composition-dir "$COMP_REL"` before editing the composition.',
   );
   await assertHyperFramesCompositionFile(
     compAbs,
     compRel,
     'meta.json',
-    'Run `npx hyperframes init` so the renderer has duration/scene metadata before dispatch.',
+    'Run `"$OD_NODE_BIN" "$OD_BIN" media scaffold --composition-dir "$COMP_REL"` so the renderer has duration/scene metadata before dispatch.',
   );
   await assertHyperFramesCompositionFile(
     compAbs,
@@ -3876,17 +3937,30 @@ async function renderHyperFramesViaCli(ctx: MediaContext, projectDir: string, on
 
   const tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'open-design-hf-'));
   const tmpOutput = path.join(tmpRoot, 'render.mp4');
+  const usesHeadlessOverride = Boolean(process.env.HYPERFRAMES_BROWSER_PATH?.trim());
+  const usesDesktopRenderer = !usesHeadlessOverride && desktopFrameRenderer != null;
   try {
-    // Pin --workers 1 to keep memory bounded (each worker is a Chrome
-    // process at ~256 MB). standard quality matches HF's default. We
-    // do NOT pass --quiet so progress lines stream out and the agent
-    // (and the user reading the chat in real time) can see frame-by-
-    // frame capture status instead of staring at a hung pipe.
-    await runHyperFramesRender(compAbs, tmpOutput, onProgress);
+    if (usesHeadlessOverride) {
+      // Explicit daemon-only override. Never auto-discover or auto-download a
+      // browser here: the packaged product path is the bundled Electron engine.
+      await runHyperFramesRender(compAbs, tmpOutput, onProgress);
+    } else if (desktopFrameRenderer) {
+      await renderHyperFramesWithDesktop(
+        compAbs,
+        tmpRoot,
+        tmpOutput,
+        desktopFrameRenderer,
+        onProgress,
+      );
+    } else {
+      throw new Error(
+        'Open Design desktop frame renderer is unavailable. Open or upgrade the desktop client and try again.',
+      );
+    }
     const bytes = await readFile(tmpOutput);
     return {
       bytes,
-      providerNote: `hyperframes/local-html · ${ctx.aspect} · ${bytes.length} bytes`,
+      providerNote: `hyperframes/${usesDesktopRenderer ? 'electron-html' : 'local-html'} · ${ctx.aspect} · ${bytes.length} bytes`,
       suggestedExt: '.mp4',
     };
   } catch (err) {
@@ -3897,6 +3971,196 @@ async function renderHyperFramesViaCli(ctx: MediaContext, projectDir: string, on
   } finally {
     await rm(tmpRoot, { recursive: true, force: true });
   }
+}
+
+async function renderHyperFramesWithDesktop(
+  compAbs: string,
+  tmpRoot: string,
+  tmpOutput: string,
+  desktopFrameRenderer: DesktopFrameRenderer,
+  onProgress?: ProgressFn,
+): Promise<void> {
+  const sourceHtml = await readFile(path.join(compAbs, 'index.html'), 'utf8');
+  const { fps, height, width } = hyperFramesCompositionMetrics(sourceHtml);
+  const browserRuntime = await readFile(resolveHyperFramesBrowserRuntimePath(), 'utf8');
+  const html = injectHyperFramesFrameBridge(sourceHtml, browserRuntime);
+  const framesDir = path.join(tmpRoot, 'frames');
+
+  onProgress?.('Rendering HyperFrames with the bundled Electron Chromium…');
+  const rendered = await desktopFrameRenderer({
+    baseHref: pathToFileURL(`${compAbs}${path.sep}`).href,
+    fps,
+    height,
+    html,
+    outputDir: framesDir,
+    width,
+  });
+  if (!rendered.ok || !rendered.framePattern || !rendered.frameCount || !rendered.fps) {
+    throw new Error(rendered.error || 'desktop frame renderer returned no frames');
+  }
+
+  onProgress?.(`Encoding ${rendered.frameCount} frame(s) at ${rendered.fps} fps…`);
+  await encodeHyperFramesMp4(rendered.framePattern, rendered.fps, tmpOutput);
+}
+
+export function hyperFramesCompositionMetrics(html: string): {
+  fps: number;
+  height: number;
+  width: number;
+} {
+  const $ = loadHtml(html);
+  const root = $('[data-composition-id]').first();
+  if (root.length === 0) {
+    throw new Error('HyperFrames index.html has no [data-composition-id] root');
+  }
+  const width = Number(root.attr('data-width'));
+  const height = Number(root.attr('data-height'));
+  const declaredFps = Number(root.attr('data-fps'));
+  const fps = Number.isFinite(declaredFps) && declaredFps > 0 ? declaredFps : 30;
+  if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+    throw new Error(
+      `HyperFrames composition has invalid dimensions: width=${String(root.attr('data-width'))}, height=${String(root.attr('data-height'))}`,
+    );
+  }
+  if (width > 8192 || height > 8192 || fps > 240) {
+    throw new Error(`HyperFrames composition exceeds renderer limits: ${width}x${height} at ${fps} fps`);
+  }
+  return { fps, height, width };
+}
+
+export function injectHyperFramesFrameBridge(sourceHtml: string, runtimeScript: string): string {
+  const safeRuntime = runtimeScript.replace(/<\/script/gi, '<\\/script');
+  const bridge = `<script>${safeRuntime}</script><script>
+(() => {
+  const nextPaint = () => new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    setTimeout(finish, 100);
+    requestAnimationFrame(() => requestAnimationFrame(finish));
+  });
+  const waitForRuntime = async () => {
+    const deadline = Date.now() + 45000;
+    while (Date.now() < deadline) {
+      const player = window.__player;
+      const duration = Number(player && typeof player.getDuration === 'function' && player.getDuration());
+      if (window.__renderReady === true && player && typeof player.renderSeek === 'function' && duration > 0) {
+        return { duration, seek: (timeSeconds) => player.renderSeek(timeSeconds, { suppressEvents: true }) };
+      }
+      const legacy = window.__hf;
+      if (legacy && typeof legacy.seek === 'function' && Number(legacy.duration) > 0) {
+        return { duration: Number(legacy.duration), seek: (timeSeconds) => legacy.seek(timeSeconds) };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const player = window.__player;
+    const duration = Number(player && typeof player.getDuration === 'function' && player.getDuration());
+    throw new Error(
+      'HyperFrames runtime was not ready after 45 seconds' +
+      ' (bootstrapped=' + String(window.__hyperframeRuntimeBootstrapped === true) +
+      ', playerReady=' + String(window.__playerReady === true) +
+      ', renderReady=' + String(window.__renderReady === true) +
+      ', duration=' + String(duration) + ')'
+    );
+  };
+  window.__odFrameRenderer = {
+    async ready() {
+      const runtime = await waitForRuntime();
+      const root = document.querySelector('[data-composition-id]');
+      const declaredDuration = Number(root && root.getAttribute('data-duration'));
+      const declaredFps = Number(root && root.getAttribute('data-fps'));
+      return {
+        duration: Number.isFinite(declaredDuration) && declaredDuration > 0
+          ? declaredDuration
+          : Number(runtime.duration),
+        fps: declaredFps > 0 ? declaredFps : 30
+      };
+    },
+    async seek(timeSeconds) {
+      const runtime = await waitForRuntime();
+      runtime.seek(timeSeconds);
+      if (typeof window.__hfWaitForSeekCompletion === 'function') {
+        await window.__hfWaitForSeekCompletion();
+      }
+      const colorGrading = window.__hf && window.__hf.colorGrading;
+      if (colorGrading && typeof colorGrading.waitForActiveLuts === 'function') {
+        await colorGrading.waitForActiveLuts();
+      }
+      if (window.__hf_page_composite_pending && typeof window.__hf_page_composite_prepare === 'function') {
+        await window.__hf_page_composite_prepare();
+        await nextPaint();
+        if (typeof window.__hf_page_composite_resolve === 'function') {
+          window.__hf_page_composite_resolve();
+        }
+      }
+      await nextPaint();
+    }
+  };
+})();
+</script>`;
+  const bodyClose = findRealTagOffset(sourceHtml, HTML_TAG_PATTERNS.bodyClose);
+  if (bodyClose >= 0) {
+    return sourceHtml.slice(0, bodyClose) + bridge + sourceHtml.slice(bodyClose);
+  }
+  return `${sourceHtml}${bridge}`;
+}
+
+function encodeHyperFramesMp4(
+  framePattern: string,
+  fps: number,
+  outputPath: string,
+): Promise<void> {
+  const ffmpegPath = process.env.HYPERFRAMES_FFMPEG_PATH?.trim() || ffmpegInstaller.path;
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn(
+      ffmpegPath,
+      [
+        '-y',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-framerate',
+        String(fps),
+        '-start_number',
+        '0',
+        '-i',
+        framePattern,
+        '-vf',
+        'pad=ceil(iw/2)*2:ceil(ih/2)*2',
+        '-c:v',
+        'libx264',
+        '-pix_fmt',
+        'yuv420p',
+        '-movflags',
+        '+faststart',
+        outputPath,
+      ],
+      { stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+    });
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('HyperFrames FFmpeg encoding timed out after 5 minutes'));
+    }, HYPERFRAMES_RENDER_TIMEOUT_MS);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) return resolve();
+      reject(new Error(
+        `FFmpeg encoding failed (${signal ? `signal ${signal}` : `exit ${String(code)}`}): ${stderr.trim()}`,
+      ));
+    });
+  });
 }
 
 async function assertHyperFramesCompositionFile(
@@ -3914,7 +4178,7 @@ async function assertHyperFramesCompositionFile(
 }
 
 /**
- * Run `npx hyperframes render` and stream every line of stdout/stderr
+ * Run the pinned HyperFrames CLI and stream every line of stdout/stderr
  * through `onProgress`. Resolves on a clean exit, rejects on non-zero
  * exit (with the stderr tail attached so the dispatcher can surface it).
  *
@@ -3926,11 +4190,11 @@ async function assertHyperFramesCompositionFile(
  */
 function runHyperFramesRender(compAbs: string, tmpOutput: string, onProgress?: ProgressFn): Promise<void> {
   return new Promise<void>((resolve, reject) => {
+    const hyperFramesCli = resolveHyperFramesCliPath();
     const child = spawn(
-      'npx',
+      resolveHyperFramesNodeBin(),
       [
-        '-y',
-        'hyperframes',
+        hyperFramesCli,
         'render',
         compAbs,
         '--output',
@@ -3939,10 +4203,13 @@ function runHyperFramesRender(compAbs: string, tmpOutput: string, onProgress?: P
         '1',
       ],
       {
-        // Inherit env so npx can find the cached hyperframes install
-        // and any user-level node config. stdin closed (HF doesn't
-        // read from it), stdout/stderr piped so we can stream.
-        env: process.env,
+        // Use the same Node-compatible runtime that owns the daemon and a
+        // pinned HyperFrames CLI shipped with Open Design. Do not delegate
+        // native dependency selection to a user-level npx cache.
+        env: {
+          ...process.env,
+          OD_HYPERFRAMES_BIN: hyperFramesCli,
+        },
         stdio: ['ignore', 'pipe', 'pipe'],
       },
     );

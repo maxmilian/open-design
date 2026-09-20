@@ -335,12 +335,19 @@ env:
   # tools-pack bakes it into open-design-config.json and the packaged runtime
   # forwards it to the daemon as OD_VELA_WEB_URL, which is the second half of the
   # workspace-team gate (the first being the AMR profile allowlist). A profile
-  # whose secret is not configured therefore ships with workspace-team dormant
-  # rather than pointed at an unknown backend. `prod` never gets an origin — the
-  # packaged gate rejects it regardless.
+  # whose selected secret is not configured therefore ships with workspace-team
+  # dormant rather than pointed at an unknown backend. An empty profile defaults
+  # to prod and receives the prod origin, matching resolveAmrProfile.
   #
-  # Secrets read here: VELA_WEB_URL_FEATURE_TEST, VELA_WEB_URL_TEST.
-  OD_VELA_WEB_URL: ${{ inputs.amr_profile == 'feature-test' && secrets.VELA_WEB_URL_FEATURE_TEST || inputs.amr_profile == 'test' && secrets.VELA_WEB_URL_TEST || '' }}
+  # OD_VELA_WEB_URL preserves the build's startup profile. The three explicit
+  # values are also baked into the package as a profile map, so the hidden
+  # runtime environment switcher can move data AND console links together.
+  # Secrets read here: VELA_WEB_URL_FEATURE_TEST, VELA_WEB_URL_TEST,
+  # VELA_WEB_URL_PROD.
+  OD_VELA_WEB_URL: ${{ inputs.amr_profile == 'feature-test' && secrets.VELA_WEB_URL_FEATURE_TEST || inputs.amr_profile == 'test' && secrets.VELA_WEB_URL_TEST || (inputs.amr_profile == 'prod' || inputs.amr_profile == '') && secrets.VELA_WEB_URL_PROD || '' }}
+  OD_VELA_WEB_URL_FEATURE_TEST: ${{ secrets.VELA_WEB_URL_FEATURE_TEST }}
+  OD_VELA_WEB_URL_TEST: ${{ secrets.VELA_WEB_URL_TEST }}
+  OD_VELA_WEB_URL_PROD: ${{ secrets.VELA_WEB_URL_PROD }}
   RELEASE_BRANCH: ${{ inputs.ref != '' && inputs.ref || github.ref_name }}
   RELEASE_REPOSITORY: ${{ github.repository }}
   RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -731,7 +738,13 @@ jobs:
           RELEASE_REPORT_DIR: ${{ runner.temp }}/release-report/mac_arm64
           RELEASE_REPORT_JSON_PATH: ${{ runner.temp }}/release-report/mac_arm64/report.json
           RELEASE_REPORT_SUMMARY_PATH: ${{ runner.temp }}/release-report/mac_arm64/summary.md
+          # The smoke step is continue-on-error, so this job reports success even
+          # when the packaged gate is red. Feed the outcome to the report writer
+          # so the failure gets a run annotation and a summary banner instead of
+          # disappearing behind a green check.
+          RELEASE_SMOKE_EXEMPT: "true"
           RELEASE_SMOKE_MODE: ${{ inputs.mac_arm64_smoke_mode }}
+          RELEASE_SMOKE_OUTCOME: ${{ steps.mac_arm64_smoke.outcome }}
           RELEASE_TARGET: mac_arm64
           RELEASE_VERSION: ${{ needs.metadata.outputs.beta_version }}
           REPORT_TITLE: mac_arm64 beta build
@@ -780,7 +793,7 @@ jobs:
           RELEASE_ASSETS_DIR: ${{ runner.temp }}/release-assets/mac_arm64
           RELEASE_CHANNEL: beta
           RELEASE_NAMESPACE: release-beta
-          RELEASE_NOTES: Open Design beta ${{ needs.metadata.outputs.beta_version }}.signed
+          RELEASE_NOTES: OpenDesign beta ${{ needs.metadata.outputs.beta_version }}.signed
           RELEASE_PUBLIC_ORIGIN: ${{ inputs.release_public_origin != '' && inputs.release_public_origin || vars.CLOUDFLARE_R2_RELEASES_PUBLIC_ORIGIN }}
           RELEASE_TARGET: mac_arm64
           RELEASE_VERSION: ${{ needs.metadata.outputs.beta_version }}
@@ -1315,7 +1328,11 @@ jobs:
           RELEASE_REPORT_DIR: ${{ runner.temp }}\release-report\win_x64
           RELEASE_REPORT_JSON_PATH: ${{ runner.temp }}\release-report\win_x64\report.json
           RELEASE_REPORT_SUMMARY_PATH: ${{ runner.temp }}\release-report\win_x64\summary.md
+          # Same exemption as mac_arm64: keep the job green, but never let the
+          # red be silent.
+          RELEASE_SMOKE_EXEMPT: "true"
           RELEASE_SMOKE_MODE: ${{ inputs.win_x64_smoke_mode }}
+          RELEASE_SMOKE_OUTCOME: ${{ steps.win_x64_smoke.outcome }}
           RELEASE_TARGET: win_x64
           RELEASE_VERSION: ${{ needs.metadata.outputs.beta_version }}
           REPORT_TITLE: win_x64 beta build

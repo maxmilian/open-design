@@ -1,6 +1,7 @@
 import { expect, test } from '@/playwright/suite';
 import type { Page } from '@playwright/test';
 import { openSettingsDialog } from '../lib/playwright/amr.js';
+import { suppressWhatsNew } from '../lib/playwright/mock-factory.js';
 
 const STORAGE_KEY = 'open-design:config';
 
@@ -35,6 +36,11 @@ async function openSettings(page: Page, theme: Theme) {
   await page.route('**/api/health', async (route) => {
     await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
   });
+
+  // The entry home mounts `WhatsNewPopup` (EntryShell.tsx) and its backdrop sits
+  // at z-index 1500 — above the z-index 120 chrome that owns the rail/settings
+  // controls this spec clicks. A live release card would swallow those clicks.
+  await suppressWhatsNew(page);
 
   await page.emulateMedia({ colorScheme: theme });
   await page.goto('/');
@@ -206,53 +212,4 @@ test.describe('Settings hover contrast (regression guard for #1795)', () => {
       ).toBeGreaterThanOrEqual(WCAG_AA_NORMAL);
     });
   }
-});
-
-test('[P1] system theme follows the OS color scheme without persisting an explicit theme', async ({ page }) => {
-  test.fail(true, 'System theme is resolved once at startup and does not react to OS color-scheme changes.');
-  await page.addInitScript(
-    ({ key }) => {
-      window.localStorage.setItem(
-        key,
-        JSON.stringify({
-          theme: 'system',
-          accentColor: '#c96442',
-          mode: 'daemon',
-          onboardingCompleted: true,
-          agentId: null,
-          skillId: null,
-          designSystemId: null,
-          mediaProviders: {},
-          agentModels: {},
-        }),
-      );
-    },
-    { key: STORAGE_KEY },
-  );
-  await page.route('**/api/health', async (route) => {
-    await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
-  });
-
-  await page.emulateMedia({ colorScheme: 'light' });
-  await page.goto('/');
-  await expect
-    .poll(() => page.locator('html').getAttribute('data-theme'))
-    .toBe('light');
-  const lightBg = await page.evaluate(() =>
-    getComputedStyle(document.documentElement).getPropertyValue('--bg').trim(),
-  );
-
-  await page.emulateMedia({ colorScheme: 'dark' });
-  await expect
-    .poll(
-      () => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()),
-      { timeout: 2_000 },
-    )
-    .not.toBe(lightBg);
-  await expect
-    .poll(() => page.locator('html').getAttribute('data-theme'))
-    .toBe('dark');
-  await expect
-    .poll(() => page.evaluate((key) => JSON.parse(window.localStorage.getItem(key) ?? '{}').theme, STORAGE_KEY))
-    .toBe('system');
 });

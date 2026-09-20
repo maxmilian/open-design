@@ -1,8 +1,13 @@
 import type { Express, Response } from 'express';
-import { PROJECT_EXPORT_MANIFEST_SCHEMA, isExportFormat } from '@open-design/contracts';
+import {
+  PROJECT_EXPORT_MANIFEST_SCHEMA,
+  isExportFormat,
+  type StandaloneHtmlExportRequest,
+} from '@open-design/contracts';
 import nodePath from 'node:path';
 import os from 'node:os';
 import { readFile, rm } from 'node:fs/promises';
+import type { Readable } from 'node:stream';
 import { isBlocked as isBlockedSystemDir } from './linked-dirs.js';
 import type { RouteDeps } from './server-context.js';
 import type {
@@ -18,6 +23,12 @@ import {
   inlineRelativeAssets,
   type InlineAssetReader,
 } from './inline-assets.js';
+import {
+  MAX_STANDALONE_ENTRY_BYTES,
+  StandaloneHtmlExportError,
+  bundleStandaloneHtml,
+  type StandaloneAssetReader,
+} from './artifacts/standalone-html.js';
 import {
   buildDeckRenderInput,
   buildScreenshotPdf,
@@ -525,6 +536,55 @@ export function registerImportRoutes(app: Express, ctx: RegisterImportRoutesDeps
 
 }
 
+/**
+ * Strip anything host-shaped out of a diagnostic string: filesystem paths
+ * (POSIX and Windows), loopback host:port pairs, and process ids.
+ */
+function stripHostDetail(value: string): string {
+  return value
+    .replace(/[A-Za-z]:\\[^\s"'<>|]+/g, '<path>')
+    .replace(/(^|[\s:'"(=])\/(?:[A-Za-z0-9._@%+-]+\/)*[A-Za-z0-9._@%+-]+/g, '$1<path>')
+    .replace(/\b(?:pid|PID)\s+\d+/g, 'pid <pid>')
+    .replace(/\b(?:127\.0\.0\.1|localhost|0\.0\.0\.0)(?::\d{2,5})?/g, '<host>')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+/**
+ * Turn a desktop-renderer IPC failure into the message we are willing to hand
+ * back over HTTP, and put the unredacted one in the daemon log.
+ *
+ * This split is the point. The renderer is reached over a unix socket whose
+ * path encodes the runtime namespace, so a failed connect arrives as
+ * `connect ENOENT /tmp/open-design/ipc/<namespace>/desktop.sock` and a timeout
+ * as `IPC request timed out: <same path>`. That string does not stop here:
+ * `od export` writes the daemon's `message` verbatim to its stderr, the agent
+ * reads it, and from there it is one prompt-adherence failure away from the
+ * user's reply. Redaction is the defence behind the prompt rule, not a
+ * replacement for it.
+ *
+ * The log call is load-bearing rather than decorative: it is the ONLY copy.
+ * `sendApiError` does not log, `recordApiFailure` keeps just
+ * {method, route, status, code} and drops the message, and the sidecar's own
+ * `traceJsonIpc` is gated behind OD_JSON_IPC_TRACE. Remove it and the socket
+ * path stops being a leak by ceasing to exist anywhere.
+ *
+ * What survives redaction is deliberate. `apps/web/src/analytics/export-error-code.ts`
+ * buckets export failures by matching this message — `unknown \w+ sidecar
+ * message` is the daemon↔desktop version-skew signal, `renderer unavailable`
+ * and `timed out` are the others — so this returns a redacted sentence rather
+ * than a fixed one. Flattening it would silently empty those buckets.
+ */
+export function describeDesktopRendererFailure(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  try {
+    console.error(`[od-export] desktop renderer ipc failed: ${raw}`);
+  } catch {
+    /* logging is best effort */
+  }
+  return `desktop renderer unavailable: ${stripHostDetail(raw)}`;
+}
+
 const DESKTOP_RENDERER_IPC_TIMEOUT_MS = 600_000;
 const RENDERER_PREVIEW_SCOPE_SETUP_MARGIN_MS = 10_000;
 const SCREENSHOT_RENDER_PREVIEW_SCOPE_TTL_MS =
@@ -567,8 +627,8 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
   const { listFiles, readProjectFile, resolveProjectFilePath } = ctx.projectFiles;
   const { isSafeId } = ctx.validation;
   const {
-    buildProjectArchive,
-    buildBatchArchive,
+    createProjectArchiveStream,
+    createBatchArchiveStream,
     buildDesktopPdfExportInput,
     buildDesktopArtifactExportInput,
     desktopPdfExporter,
@@ -577,14 +637,40 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
     daemonUrlRef,
     sanitizeArchiveFilename,
   } = ctx.exports;
+  const pipeArchiveDownload = (res: Response, stream: Readable) => {
+    stream.once('error', (error: unknown) => {
+      if (!res.headersSent) {
+        sendApiError(res, 400, 'BAD_REQUEST', String((error as Error)?.message || error));
+      } else {
+        res.destroy(error as Error);
+      }
+    });
+    res.once('close', () => stream.destroy());
+    stream.pipe(res);
+  };
   async function authorizeExportRead(
     req: any,
     res: any,
-    options: { allowNavigationQuery?: boolean; toolEndpoint?: string } = {},
+    options: {
+      allowNavigationQuery?: boolean;
+      deriveWorkspaceFromProject?: boolean;
+      toolEndpoint?: string;
+    } = {},
   ): Promise<AuthorizedExportRead | null> {
     const authorization = req.get('authorization');
+    // Only Bearer credentials can be run-scoped tool tokens: that is the sole
+    // shape `bearerTokenFromRequest` parses. A reverse proxy that authenticates
+    // browsers itself (Coolify/Traefik basic auth) forwards its own
+    // `Authorization: Basic ...` header, and claiming those for the tool lane
+    // fails every browser export with TOOL_TOKEN_MISSING. Foreign Bearer
+    // tokens still fail closed inside the registry.
+    // The scheme is classified independently of whether a token follows it: a
+    // bare `Bearer` (or `Bearer ` trimmed to it) is still a caller reaching for
+    // the tool-token lane and must keep failing closed with TOOL_TOKEN_MISSING
+    // rather than downgrading to browser project authority.
     if (
       typeof authorization === 'string'
+      && /^Bearer(?:\s|$)/i.test(authorization.trim())
       && !ctx.isApiTokenAuthorization(authorization)
     ) {
       const grant = ctx.auth.authorizeToolRequest(
@@ -601,6 +687,14 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
       const authority = await ctx.authorizeProjectToolRequest(
         res,
         grant.projectId,
+        { mode: 'read' },
+      );
+      return authority ? { previewWorkspace: authority.workspace } : null;
+    }
+    if (options.deriveWorkspaceFromProject) {
+      const authority = await ctx.authorizeProjectToolRequest(
+        res,
+        req.params.id,
         { mode: 'read' },
       );
       return authority ? { previewWorkspace: authority.workspace } : null;
@@ -690,6 +784,155 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
     return null;
   }
 
+  async function handleStandaloneHtmlExport(
+    res: Response,
+    projectId: string,
+    body: StandaloneHtmlExportRequest | null | undefined,
+  ) {
+    try {
+      if (!isSafeId(projectId)) {
+        return sendApiError(res, 400, 'BAD_REQUEST', 'invalid project id');
+      }
+      const fileName = typeof body?.fileName === 'string' ? body.fileName.trim() : '';
+      if (!fileName) {
+        return sendApiError(res, 400, 'BAD_REQUEST', 'fileName required');
+      }
+      if (typeof body?.versionId === 'string' && body.versionId.trim()) {
+        return sendApiError(
+          res,
+          409,
+          'CONFLICT',
+          'standalone HTML cannot export a historical entry with current project dependencies',
+          { details: { kind: 'historical-dependency-snapshot-unavailable' } },
+        );
+      }
+
+      const project = getProject(db, projectId);
+      if (!project) {
+        return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+      }
+
+      let ownerMeta;
+      try {
+        ownerMeta = await resolveProjectFilePath(
+          PROJECTS_DIR,
+          projectId,
+          fileName,
+          project.metadata,
+        );
+      } catch (error: any) {
+        const missing = error?.code === 'ENOENT';
+        return sendApiError(
+          res,
+          missing ? 404 : 400,
+          missing ? 'FILE_NOT_FOUND' : 'BAD_REQUEST',
+          missing ? `HTML entry not found: ${fileName}` : String(error?.message || error),
+        );
+      }
+      if (ownerMeta.size > MAX_STANDALONE_ENTRY_BYTES) {
+        return sendApiError(
+          res,
+          413,
+          'PAYLOAD_TOO_LARGE',
+          `owner html ${ownerMeta.size} bytes exceeds ${MAX_STANDALONE_ENTRY_BYTES}`,
+          { details: { kind: 'limit-exceeded', limit: 'entryBytes' } },
+        );
+      }
+      if (!ownerMeta.mime.startsWith('text/html')) {
+        return sendApiError(
+          res,
+          415,
+          'UNSUPPORTED_MEDIA_TYPE',
+          'standalone export only supports HTML entry files',
+        );
+      }
+
+      const ownerFile = await readProjectFile(
+        PROJECTS_DIR,
+        projectId,
+        fileName,
+        project.metadata,
+      );
+      const exportSource = await resolveHtmlExportSource({
+        projectId,
+        projectsRoot: PROJECTS_DIR,
+        relPath: fileName,
+        html: ownerFile.buffer.toString('utf8'),
+        metadata: project.metadata,
+        readProjectFile,
+        resolveProjectFilePath,
+      });
+      const assetReader: StandaloneAssetReader = async (projectPath) => {
+        let meta;
+        try {
+          meta = await resolveProjectFilePath(
+            PROJECTS_DIR,
+            projectId,
+            projectPath,
+            project.metadata,
+          );
+        } catch (error: any) {
+          if (error?.code === 'ENOENT') return null;
+          throw error;
+        }
+        return {
+          mime: meta.mime,
+          size: meta.size,
+          read: async () => {
+            const file = await readProjectFile(
+              PROJECTS_DIR,
+              projectId,
+              projectPath,
+              project.metadata,
+            );
+            return file.buffer;
+          },
+        };
+      };
+      const bundled = await bundleStandaloneHtml({
+        entryPath: exportSource.relPath,
+        html: exportSource.html,
+        readAsset: assetReader,
+      });
+
+      const titleBase = typeof body?.title === 'string' && body.title.trim()
+        ? body.title.trim()
+        : path.basename(fileName, path.extname(fileName)) || 'artifact';
+      const filename = `${sanitizeArchiveFilename(titleBase) || 'artifact'}.html`;
+      const asciiFallback = filename.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, '_');
+      res.setHeader('Content-Security-Policy', 'sandbox allow-scripts');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      );
+      res.setHeader(
+        'X-Open-Design-External-Dependencies',
+        String(bundled.externalDependencies.length),
+      );
+      return res.type('text/html').send(bundled.html);
+    } catch (error: any) {
+      if (error instanceof StandaloneHtmlExportError || error?.name === 'StandaloneHtmlExportError') {
+        const standaloneError = error as StandaloneHtmlExportError;
+        const details = {
+          kind: standaloneError.kind,
+          ...(standaloneError.dependency ? { dependency: standaloneError.dependency } : {}),
+          ...(standaloneError.chain.length > 0 ? { chain: standaloneError.chain } : {}),
+          ...(standaloneError.limit ? { limit: standaloneError.limit } : {}),
+        };
+        if (standaloneError.kind === 'limit-exceeded') {
+          return sendApiError(res, 413, 'PAYLOAD_TOO_LARGE', standaloneError.message, { details });
+        }
+        const status = standaloneError.kind === 'missing-local-dependency'
+          || standaloneError.kind === 'invalid-source'
+          ? 422
+          : 400;
+        const code = status === 422 ? 'VALIDATION_FAILED' : 'BAD_REQUEST';
+        return sendApiError(res, status, code, standaloneError.message, { details });
+      }
+      return sendApiError(res, 400, 'BAD_REQUEST', String(error?.message || error));
+    }
+  }
+
   // Shared screenshot-export flow: render the deck to one PNG per slide via the
   // desktop's Electron Chromium, then assemble the requested binary. Both the
   // .pptx and raster-.pdf routes funnel through here. Like the PDF route, it
@@ -752,7 +995,7 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
               res,
               502,
               'UPSTREAM_UNAVAILABLE',
-              `desktop renderer unavailable: ${err?.message || String(err)}`,
+              describeDesktopRendererFailure(err),
             );
           } finally {
             if (renderPreviewScope) {
@@ -860,7 +1103,7 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
       const tStart = Date.now();
       const { input, title: resolvedTitle, defaultFilename } =
         await buildDeckRenderInput(renderOptions);
-      // The renderer call is a cross-process IPC (requestJsonIpc, 600s). A
+      // The renderer call crosses the sidecar client boundary (600s). A
       // missing desktop process, broken socket, or timeout is an upstream
       // renderer outage — surface it as 502 UPSTREAM_UNAVAILABLE (matching the
       // `!rendered.ok` branch below), not the outer 400 BAD_REQUEST which is for
@@ -873,7 +1116,7 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
           res,
           502,
           'UPSTREAM_UNAVAILABLE',
-          `desktop renderer unavailable: ${err?.message || String(err)}`,
+          describeDesktopRendererFailure(err),
         );
       } finally {
         if (renderPreviewScope) {
@@ -1076,7 +1319,7 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
       const root = typeof req.query?.root === 'string' ? req.query.root : '';
       if (!await authorizeExportRead(req, res, { allowNavigationQuery: true })) return;
       const project = getProject(db, req.params.id);
-      const { buffer, baseName } = await buildProjectArchive(
+      const { stream, baseName } = await createProjectArchiveStream(
         PROJECTS_DIR,
         req.params.id,
         root,
@@ -1095,7 +1338,7 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
         'Content-Disposition',
         `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
       );
-      res.send(buffer);
+      pipeArchiveDownload(res, stream);
     } catch (err: any) {
       const code = err && err.code;
       const status = code === 'ENOENT' || code === 'ENOTDIR' ? 404 : 400;
@@ -1119,7 +1362,7 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
       }
       if (!await authorizeExportRead(req, res)) return;
       const project = getProject(db, req.params.id);
-      const { buffer } = await buildBatchArchive(
+      const { stream } = await createBatchArchiveStream(
         PROJECTS_DIR,
         req.params.id,
         files,
@@ -1134,7 +1377,7 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
         'Content-Disposition',
         `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
       );
-      res.send(buffer);
+      pipeArchiveDownload(res, stream);
     } catch (err: any) {
       const code = err && err.code;
       const status = code === 'ENOENT' ? 404 : 400;
@@ -1221,7 +1464,10 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
   // PNG and assemble a one-image-per-slide .pptx. Replaces the old "send a prompt
   // to the agent and hope it runs python-pptx" path with a deterministic export.
   app.post('/api/projects/:id/export/pptx', async (req, res) => {
-    const authority = await authorizeExportRead(req, res, { toolEndpoint: PROJECT_EXPORT_TOOL_ENDPOINT });
+    const authority = await authorizeExportRead(req, res, {
+      deriveWorkspaceFromProject: true,
+      toolEndpoint: PROJECT_EXPORT_TOOL_ENDPOINT,
+    });
     if (!authority) return;
     await handleScreenshotExport(res, 'pptx', req.params.id, { authority, body: req.body });
   });
@@ -1230,7 +1476,10 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
   // The print-ready vector PDF stays on POST /export/pdf; this is the "exactly
   // what you see" counterpart that shares the slide renderer with PPTX.
   app.post('/api/projects/:id/export/pdf-image', async (req, res) => {
-    const authority = await authorizeExportRead(req, res, { toolEndpoint: PROJECT_EXPORT_TOOL_ENDPOINT });
+    const authority = await authorizeExportRead(req, res, {
+      deriveWorkspaceFromProject: true,
+      toolEndpoint: PROJECT_EXPORT_TOOL_ENDPOINT,
+    });
     if (!authority) return;
     await handleScreenshotExport(res, 'pdf', req.params.id, { authority, body: req.body });
   });
@@ -1240,20 +1489,31 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
   // the whole document at natural size. Viewport-independent — unlike the
   // host-compositor snapshot, the size never depends on the preview pane.
   app.post('/api/projects/:id/export/image', async (req, res) => {
-    const authority = await authorizeExportRead(req, res, { toolEndpoint: PROJECT_EXPORT_TOOL_ENDPOINT });
+    const authority = await authorizeExportRead(req, res, {
+      deriveWorkspaceFromProject: true,
+      toolEndpoint: PROJECT_EXPORT_TOOL_ENDPOINT,
+    });
     if (!authority) return;
     await handleScreenshotExport(res, 'image', req.params.id, { authority, body: req.body });
   });
 
-  // Generic programmatic export (PDF / image / PPTX) for the `od export` CLI and
-  // any caller using the shared `ExportRequest` contract. EVERY format rasterizes
-  // through the desktop screenshot renderer — `pdf` is the raster screenshot PDF
-  // (one page per deck slide / per viewport for a long page), exactly like the
-  // dedicated /export/{pptx,pdf-image,image} routes and what the web UI uses.
-  // There is deliberately NO vector printToPDF path here: it drops CJK glyphs in
-  // the packaged runtime, which is the fidelity bug this feature exists to avoid.
-  // handleScreenshotExport owns validation, the 404/400/422 error mapping, and
-  // scratch-dir cleanup.
+  // A true one-file HTML export: every required same-project dependency is
+  // embedded by the daemon. Remote HTTP(S) dependencies remain external and
+  // are listed in a machine-readable manifest inside the output.
+  app.post('/api/projects/:id/export/html', async (req, res) => {
+    const authority = await authorizeExportRead(req, res, {
+      deriveWorkspaceFromProject: true,
+      toolEndpoint: PROJECT_EXPORT_TOOL_ENDPOINT,
+    });
+    if (!authority) return;
+    await handleStandaloneHtmlExport(res, req.params.id, req.body);
+  });
+
+  // Generic programmatic export (HTML / PDF / image / PPTX) for callers using
+  // the shared `ExportRequest` contract. HTML uses the headless standalone
+  // bundler above. Visual formats use the dedicated screenshot renderer paths;
+  // there is deliberately no vector printToPDF fallback because it drops CJK
+  // glyphs in the packaged runtime.
   app.post('/api/projects/:id/export', async (req, res) => {
     const { fileName, title, deck, format, imageFormat, width, height, versionId } = req.body || {};
     if (typeof fileName !== 'string' || fileName.length === 0) {
@@ -1262,8 +1522,18 @@ export function registerProjectExportRoutes(app: Express, ctx: RegisterProjectEx
     if (!isExportFormat(format)) {
       return sendApiError(res, 400, 'BAD_REQUEST', 'invalid export format');
     }
-    const authority = await authorizeExportRead(req, res, { toolEndpoint: PROJECT_EXPORT_TOOL_ENDPOINT });
+    const authority = await authorizeExportRead(req, res, {
+      deriveWorkspaceFromProject: true,
+      toolEndpoint: PROJECT_EXPORT_TOOL_ENDPOINT,
+    });
     if (!authority) return;
+    if (format === 'html') {
+      return handleStandaloneHtmlExport(res, req.params.id, {
+        fileName,
+        ...(typeof title === 'string' ? { title } : {}),
+        ...(typeof versionId === 'string' ? { versionId } : {}),
+      });
+    }
     await handleScreenshotExport(res, format, req.params.id, {
       authority,
       body: {
@@ -1526,8 +1796,9 @@ async function resolveHtmlExportSource({
       html: rewriteViteDistRootAssetUrls(distFile.buffer.toString('utf8')),
       relPath: distRelPath,
     };
-  } catch {
-    return { html, relPath };
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return { html, relPath };
+    throw error;
   }
 }
 
