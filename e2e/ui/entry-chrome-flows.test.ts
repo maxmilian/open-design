@@ -378,15 +378,11 @@ test('[P1] hero-created projects clear their pending prompt and never re-seed a 
   await composer.fill(GAMMA);
   await expect(composer).toHaveText(GAMMA);
 
-  // Leaving the project goes through the pinned entry tab, not a back button:
-  // #5517 gave ChatPane's top-left slot to the pane-collapse control and the
+  // Leaving the project goes through real chrome, not a back button: #5517 gave
+  // ChatPane's top-left slot to the pane-collapse control and the
   // `AppChromeHeader` that owned "Back to projects" is no longer mounted, so
-  // that locator only resolves inside the closed avatar popover. Same intent
-  // (leave the project through real chrome), current carrier — this mirrors
-  // `leaveProjectForEntry` in `real-daemon-run.test.ts`.
-  const pinnedEntryTab = page.locator('.workspace-tab.is-pinned');
-  await expect(pinnedEntryTab).toBeVisible();
-  await pinnedEntryTab.locator('.workspace-tab__main').click();
+  // that locator only resolves inside the closed avatar popover.
+  await leaveProjectForEntry(page);
   const hero = page.getByTestId('home-hero-input');
   await expect(hero).toBeVisible();
   await expect(hero).toHaveText('');
@@ -1841,6 +1837,24 @@ function isCreateRunRequest(request: Request): boolean {
 function isCreateProjectRequest(request: Request): boolean {
   const url = new URL(request.url());
   return url.pathname === '/api/projects' && request.method() === 'POST';
+}
+
+// Per-file copy, matching `real-daemon-run.test.ts` and `app-restoration.test.ts`
+// (this suite copies its helpers rather than sharing them). In docked project
+// mode the state-bearing pinned tab stays mounted in the hidden dock strip and
+// `workspace-home-chrome` is its visible, interactive stand-in in the top
+// chrome; outside docked mode the pinned tab itself is the control.
+async function leaveProjectForEntry(page: Page) {
+  const dockedHome = page.getByTestId('workspace-home-chrome');
+  if (await dockedHome.isVisible().catch(() => false)) {
+    await dockedHome.click();
+    await expect(page.getByTestId('file-workspace')).toHaveCount(0);
+    return;
+  }
+  const pinnedEntryTab = page.locator('.workspace-tab.is-pinned');
+  await expect(pinnedEntryTab).toBeVisible();
+  await pinnedEntryTab.locator('.workspace-tab__main').click();
+  await expect(page.getByTestId('file-workspace')).toHaveCount(0);
 }
 
 // The PATCH `ProjectView` issues on mount to wipe the seeded `pendingPrompt`.
