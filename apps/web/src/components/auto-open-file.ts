@@ -16,6 +16,9 @@
 //      project file (those will have a slash in `filePath` and reach this
 //      step with zero suffix matches → declined).
 
+import { withLiveArtifactDeliveries } from '../runtime/live-artifact-delivery';
+import type { AgentEvent } from '../types';
+
 interface CandidateFile {
   readonly name: string;
   readonly path?: string;
@@ -450,6 +453,10 @@ export interface AutoOpenSettleRequest<F extends CandidateFile = CandidateFile> 
   // A count of user activations answers both: any change means the user has
   // taken the workspace over since the turn ended, whatever they moved to.
   readonly userActivationsAtTurnEnd: number;
+  // The turn's agent events. A registered live artifact replaces its raw
+  // template.html at turn end (`withLiveArtifactDeliveries`); re-evaluation has
+  // to apply the same rule, or it pulls focus back to the template.
+  readonly liveArtifactEvents?: readonly AgentEvent[];
   // Epoch ms after which the turn stops being re-evaluated.
   readonly deadline: number;
 }
@@ -493,11 +500,19 @@ export function reevaluateAutoOpenOnFilesSettled<F extends CandidateFile>(
     return { openFileName: null, keepWatching: false };
   }
 
-  const resolved = selectAutoOpenTurnArtifact(
-    request.producedFiles,
-    allFiles,
-    request.resolveTurnOptions(allFiles),
-  );
+  // A live tab is never in the file list, so it reads as "not openable yet"
+  // below: the watch keeps the turn-end focus instead of correcting it.
+  const resolved = withLiveArtifactDeliveries(
+    {
+      open: [],
+      focused: selectAutoOpenTurnArtifact(
+        request.producedFiles,
+        allFiles,
+        request.resolveTurnOptions(allFiles),
+      ),
+    },
+    request.liveArtifactEvents,
+  ).focused;
   // Nothing selectable yet — the list may still be catching up.
   if (!resolved) return { openFileName: null, keepWatching: true };
   // Selected, but the workspace cannot render it as a tab yet: a produced-file

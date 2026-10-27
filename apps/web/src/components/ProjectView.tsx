@@ -5404,10 +5404,13 @@ export function ProjectView({
       // the whole reason this pass exists is that the turn-end list was
       // incomplete, so its batch can be short for the same reason its focus
       // was wrong.
-      const settledTurnArtifacts = selectAutoOpenTurnArtifacts(
-        pending.request.producedFiles,
-        projectFilesRef.current,
-        pending.request.resolveTurnOptions(projectFilesRef.current),
+      const settledTurnArtifacts = withLiveArtifactDeliveries(
+        selectAutoOpenTurnArtifacts(
+          pending.request.producedFiles,
+          projectFilesRef.current,
+          pending.request.resolveTurnOptions(projectFilesRef.current),
+        ),
+        pending.request.liveArtifactEvents,
       );
       if (settledTurnArtifacts.open.length > 1) {
         requestOpenTurnArtifacts(
@@ -10537,6 +10540,7 @@ export function ProjectView({
                     requestedFileName: producedArtifactToOpen ?? null,
                     activeFileNameAtTurnEnd: activeFileNameAtTerminalHandoff,
                     userActivationsAtTurnEnd: userActivationsAtTerminalHandoff,
+                    liveArtifactEvents: latestAssistantMsg.events,
                     turnOwnedFileNames: runAutoOpenedFileNames,
                     deadline: Date.now() + AUTO_OPEN_SETTLE_WINDOW_MS,
                   },

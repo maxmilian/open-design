@@ -345,4 +345,62 @@ describe('ProjectView live-artifact auto-open ownership', () => {
 
     expect(openRequestKeys().slice(openedBeforeRelease)).toEqual([]);
   });
+
+  it('does not let the settle watch pull a live-artifact turn back to its template.html', async () => {
+    // The turn-end pass hands a registered live artifact's focus to its `live:`
+    // tab and drops the raw template.html it was rendered from. The settle
+    // watcher re-runs the plain file selection, so without the same delivery
+    // rule it picks template.html again and moves focus off the live tab.
+    const startedAt = Date.now();
+    const template = projectFile('template.html', 'html', startedAt + 20);
+    let turnDone = false;
+
+    loadTabs.mockResolvedValue({ tabs: ['notes.md'], active: 'notes.md' });
+    fetchProjectFiles.mockImplementation(async () =>
+      turnDone ? [NOTES, OTHER, template] : [NOTES, OTHER],
+    );
+
+    const handlers: StreamHandlers[] = [];
+    streamViaDaemon.mockImplementation(async (opts: { handlers: StreamHandlers }) => {
+      handlers.push(opts.handlers);
+      return new Promise<void>(() => {});
+    });
+
+    renderProjectView('project-live-settle');
+
+    const sendProps = await waitForSend();
+    await act(async () => {
+      await sendProps.onSend!('build me a board', [], []);
+    });
+    await waitFor(() => expect(streamViaDaemon).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      handlers[0]!.onAgentEvent({
+        kind: 'live_artifact',
+        action: 'created',
+        artifactId: 'a1',
+      });
+    });
+    turnDone = true;
+    await act(async () => {
+      handlers[0]!.onDone('done');
+    });
+    await waitFor(() =>
+      expect(openRequestKeys().map((key) => key.name)).toContain('live:a1'),
+    );
+
+    // Later settled lists, the way chokidar-driven refreshes would land them.
+    for (let i = 0; i < 2; i += 1) {
+      await act(async () => {
+        const props = fileWorkspaceSpy.mock.calls.at(-1)?.[0] as {
+          onRefreshFiles?: (options?: unknown) => Promise<unknown>;
+        };
+        await props.onRefreshFiles?.({ fresh: true });
+      });
+    }
+
+    const names = openRequestKeys().map((key) => key.name);
+    expect(names).not.toContain('template.html');
+    expect(names.at(-1)).toBe('live:a1');
+  });
 });
